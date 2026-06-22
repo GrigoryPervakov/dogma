@@ -1,0 +1,29 @@
+---
+source: tests/render.rs
+assertion_line: 206
+expression: "render_buf(&mut app, 100, 24)"
+---
+dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory    diag             
+Sessions  · / search        # design TUI                                                            
+────────────────────────────  ↑ press up to load older messages                                     
+  + new chat               │┌ user · 14:32 · text──────────────────────────────────────────────────┐
+    design TUI             ││Take a look at src/parser.rs and tell me if the pattern is consistent.│
+                           ││                                                                      │
+                           ││                                                                      │
+                           │└──────────────────────────────────────────────────────────────────────┘
+                           │┌ assistant · 14:32 · text─────────────────────────────────────────────┐
+                           ││Consistent in 12 of 13 sites. The outlier is src/lexer.rs: it returns │
+                           ││`Ok(())` when it should return `Err(Invalid)`.                        │
+                           ││                                                                      │
+                           ││                                                                      │
+                           │└──────────────────────────────────────────────────────────────────────┘
+                           │ ▶ tool:Bash · cargo check                                              
+                           │                                                                        
+                           │                                                                        
+                           │                                                                        
+                           │                                                                        
+                           │                                                                        
+                           │┌ input · ↓ or i to focus ─────────────────────────────────────────────┐
+                           ││                                                                      │
+                           │└──────────────────────────────────────────────────────────────────────┘
+NORMAL · chat │ idle │ session: design TUI │ ○ ws offline │ ctx — Enter expand · Esc back · / find ·

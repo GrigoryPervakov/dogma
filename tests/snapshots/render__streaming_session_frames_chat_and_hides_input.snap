@@ -1,0 +1,29 @@
+---
+source: tests/render.rs
+assertion_line: 232
+expression: "render_buf(&mut app, 100, 24)"
+---
+dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory    diag             
+Sessions  · / search        # live                                                                  
+────────────────────────────┏ ▶ streaming… ━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+  + new chat               │┃  ↑ press up to load older messages                                   ┃
+  ● live                   │┃┌ user · 14:32 · text────────────────────────────────────────────────┐┃
+                           │┃│Run the check.                                                      │┃
+                           │┃│                                                                    │┃
+                           │┃│                                                                    │┃
+                           │┃└────────────────────────────────────────────────────────────────────┘┃
+                           │┃┌ assistant · 14:32 · text───────────────────────────────────────────┐┃
+                           │┃│Running it now.                                                     │┃
+                           │┃│                                                                    │┃
+                           │┃│                                                                    │┃
+                           │┃└────────────────────────────────────────────────────────────────────┘┃
+                           │┃ ▶ tool:Bash · cargo check                                            ┃
+                           │┃                                                                      ┃
+                           │┃                                                                      ┃
+                           │┃                                                                      ┃
+                           │┃                                                                      ┃
+                           │┃                                                                      ┃
+                           │┃                                                                      ┃
+                           │┃                                                                      ┃
+                           │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+NORMAL · chat │ ⠋ writing │ session: live │ ○ ws offline │ ctx — Enter expand · Esc back · / find ·

@@ -1,0 +1,17 @@
+---
+source: tests/render.rs
+assertion_line: 327
+expression: "render_buf(&mut app, 80, 12)"
+---
+dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory 
+Sessions  · / search        # + new chat                                        
+────────────────────────────                                                    
+▶ + new chat               │                                                    
+    session                │no messages yet — type below and press Enter to star
+                           │                                                    
+                           │                                                    
+                           │                                                    
+                           │┌ input · ↓ or i to focus ─────────────────────────┐
+                           ││                                                  │
+                           │└──────────────────────────────────────────────────┘
+:fork "new branch"▏   Tab complete · Enter run · Esc cancel

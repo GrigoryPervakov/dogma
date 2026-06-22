@@ -1,0 +1,29 @@
+---
+source: tests/render.rs
+assertion_line: 410
+expression: "render_buf(&mut app, 100, 24)"
+---
+dogma   chat    notifs   [tasks]   plans    skills    cron    sources    memory    diag             
+Tasks (3)                           # Fix flaky webhook test                                        
+────────────────────────────────────                                                                
+▶ ❯ Fix flaky webhook test         │status     in_progress                                          
+  • Review PR #175                 │deadline   2026-05-02 12:00                                     
+  ✓ Rebase main                    │source     github                                               
+                                   │url        https://github.com/x/y/issues/42                     
+                                   │created    2026-04-25 10:00:00                                  
+                                   │                                                                
+                                   │Repro                                                           
+                                   │                                                                
+                                   │The webhook test fails ~30% of runs:                            
+                                   │                                                                
+                                   │┌─ code ─                                                       
+                                   ││ --- FAIL: TestWebhookFlow                                     
+                                   │└────────────────────────────────────────                       
+                                   │Plan                                                            
+                                   │                                                                
+                                   │• [ ] Check timing assumptions                                  
+                                   │• [ ] Add retry on transient errors                             
+                                   │                                                                
+                                   │                                                                
+                                   │                                                                
+NORMAL · tasks │ ○ ws offline                  ↑↓/jk move · Enter open · r refresh · Tab switch tab

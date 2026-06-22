@@ -1,0 +1,27 @@
+---
+source: tests/render.rs
+assertion_line: 517
+expression: "render_buf(&mut app, 100, 22)"
+---
+dogma   chat    notifs    tasks    plans   [skills]   cron    sources    memory    diag             
+Skills (3)                          # example-dev                                                   
+────────────────────────────────────                                                                
+▶ ● example-dev                    │description  Example project dev workflow                       
+  ● nerve-dev                      │version      1.0                                                
+  ○ old-skill                      │enabled      yes                                                
+                                   │usage        42                                                 
+                                   │last used    2026-04-28 14:00:00                                
+                                   │                                                                
+                                   │Example Dev                                                     
+                                   │                                                                
+                                   │Use when working in `~/code/example`.                           
+                                   │                                                                
+                                   │Build                                                           
+                                   │                                                                
+                                   │• `make build`                                                  
+                                   │• `make test`                                                   
+                                   │• `make lint`                                                   
+                                   │                                                                
+                                   │                                                                
+                                   │                                                                
+NORMAL · skills │ ○ ws offline                 ↑↓/jk move · Enter open · r refresh · Tab switch tab

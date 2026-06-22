@@ -1,0 +1,27 @@
+---
+source: tests/render.rs
+assertion_line: 460
+expression: "render_buf(&mut app, 100, 22)"
+---
+dogma   chat    notifs    tasks   [plans]   skills    cron    sources    memory    diag             
+Plans (2)                           # Refactor the parser pipeline                                  
+────────────────────────────────────                                                                
+▶ ◷ Refactor the parser pipeline   │status     pending                                              
+  ✓ Update webhook validation      │task       t1                                                   
+                                   │runtime    claude                                               
+                                   │created    2026-04-29 11:00:00                                  
+                                   │                                                                
+                                   │Goal                                                            
+                                   │                                                                
+                                   │Split the monolithic parse loop into named steps.               
+                                   │                                                                
+                                   │Steps                                                           
+                                   │                                                                
+                                   │1. Extract `prep` step                                          
+                                   │2. Extract `validate` step                                      
+                                   │3. Extract `apply` step                                         
+                                   │4. Wire the pipeline registry                                   
+                                   │                                                                
+                                   │                                                                
+                                   │                                                                
+NORMAL · plans │ ○ ws offline                  ↑↓/jk move · Enter open · r refresh · Tab switch tab

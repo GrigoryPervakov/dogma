@@ -1,0 +1,57 @@
+[package]
+name = "dogma"
+version = "0.1.0"
+edition = "2024"
+description = "dogma — a terminal UI for Nerve"
+rust-version = "1.88"
+
+[[bin]]
+name = "dogma"
+path = "src/main.rs"
+
+[dependencies]
+# TUI — multi-line input lives in src/ui/textarea.rs (we dropped tui-textarea
+# because it doesn't track ratatui's release cadence).
+ratatui = "0.30.0"
+crossterm = "0.29.0"
+
+# Async runtime
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time", "io-util", "net", "signal"] }
+tokio-tungstenite = { version = "0.29", features = ["rustls-tls-native-roots"] }
+futures-util = { version = "0.3", default-features = false, features = ["sink", "std"] }
+
+# HTTP client
+reqwest = { version = "0.13", default-features = false, features = ["json", "query", "charset", "rustls", "rustls-native-certs", "http2"] }
+url = "2"
+
+# Serde
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+chrono = { version = "0.4", features = ["serde"] }
+
+# Errors
+anyhow = "1"
+thiserror = "2"
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Config & CLI
+clap = { version = "4", features = ["derive", "env"] }
+rpassword = "7.5.4"
+toml = "1"
+
+# Markdown + syntax highlighting
+pulldown-cmark = "0.13"
+syntect = { version = "5", default-features = false, features = ["default-fancy"] }
+once_cell = "1"
+
+[dev-dependencies]
+insta = { version = "1", features = ["yaml"] }
+proptest = "1"
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = true

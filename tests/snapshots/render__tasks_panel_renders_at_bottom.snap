@@ -1,0 +1,29 @@
+---
+source: tests/render.rs
+assertion_line: 276
+expression: "render_buf(&mut app, 100, 24)"
+---
+dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory    diag             
+Sessions  · / search        # tasks demo                                                            
+────────────────────────────  ↑ press up to load older messages                                     
+  + new chat               │┌ assistant · 14:32 · text─────────────────────────────────────────────┐
+    tasks demo             ││Planning the work.                                                    │
+                           ││                                                                      │
+                           ││                                                                      │
+                           │└──────────────────────────────────────────────────────────────────────┘
+                           │ tool:TaskCreate · {"activeForm":"Reading the file","subject":"Read the…
+                           │ tool:TaskCreate · {"subject":"Write the fix"}                          
+                           │ ▶ tool:TaskUpdate · {"status":"in_progress","taskId":"1"}              
+                           │                                                                        
+                           │                                                                        
+                           │                                                                        
+                           │                                                                        
+                           │                                                                        
+                           │┌ tasks ───────────────────────────────────────────────────────────────┐
+                           ││ ◐ Reading the file                                                   │
+                           ││ ○ Write the fix                                                      │
+                           │└──────────────────────────────────────────────────────────────────────┘
+                           │┌ input · ↓ or i to focus ─────────────────────────────────────────────┐
+                           ││                                                                      │
+                           │└──────────────────────────────────────────────────────────────────────┘
+NORMAL · chat │ idle │ session: tasks demo │ ○ ws offline │ ctx — Enter expand · Esc back · / find ·

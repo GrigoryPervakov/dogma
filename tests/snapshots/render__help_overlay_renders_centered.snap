@@ -1,0 +1,35 @@
+---
+source: tests/render.rs
+assertion_line: 343
+expression: "render_buf(&mut app, 100, 30)"
+---
+dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory    diag             
+Sessions  · / search        # + new chat                                                            
+────────────────────────────                                                                        
+▶ + new chat┌ help ────────────────────────────────────────────────────────────────────┐            
+    (no sess│GLOBAL                                                                    │art         
+            │  Tab / S-Tab  cycle tabs    :  command    ?  help    q  quit             │            
+            │  Ctrl+C  stop the running agent (or quit)                                │            
+            │COMMANDS   (Tab autocompletes; singular or plural)                        │            
+            │  tabs     :chat  :notifs  :tasks  :plans  :skills                        │            
+            │  actions  :new  :fork  :resume  :rename  :delete  :reload  :q            │            
+            │CHAT                                                                      │            
+            │  Sessions  ↑↓/jk walk · Enter/→ open · / search                          │            
+            │  Messages  ↑↓/jk walk · g/G top/bot · PgUp/Dn · Enter expand             │            
+            │            i/a input · Ctrl+B sidebar · Ctrl+P panel                     │            
+            │  Block     ↑↓/jk scroll · g/G top/bot · PgUp/Dn · Esc/← back             │            
+            │  Input     Enter → insert · ↑/Esc back                                   │            
+            │  Insert    Enter send · Shift-Enter newline · Esc back                   │            
+            │  Poll      ↑↓ option · ←→ question · Space select · Enter ok · Esc skip  │            
+            │NOTIFS                                                                    │            
+            │  ↑↓/jk move · 1-9 answer poll · d dismiss · r refresh · Enter detail     │            
+            │TASKS · PLANS · SKILLS                                                    │            
+            │  ↑↓/jk move · Enter/→ detail · r refresh                                 │            
+            │                                                                          │            
+            │press any key to close                                                    │            
+            │                                                                          │            
+            │                                                                          │            
+            └──────────────────────────────────────────────────────────────────────────┘───────────┐
+                           ││                                                                      │
+                           │└──────────────────────────────────────────────────────────────────────┘
+HELP │ idle │ session: + new chat │ ○ ws offline │ ctx —                              press any key

@@ -1,0 +1,19 @@
+---
+source: tests/render.rs
+assertion_line: 531
+expression: "render_buf(&mut app, 70, 14)"
+---
+dogma  [chat]   notifs    tasks    plans    skills    cron    sources 
+# narrow test                                                         
+  ↑ press up to load older messages                                   
+┏ ▶ user · 14:32 · text━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┓
+┃Quick question.                                                     ┃
+┃                                                                    ┃
+┃                                                                    ┃
+┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                                                                      
+                                                                      
+┌ input · ↓ or i to focus ───────────────────────────────────────────┐
+│                                                                    │
+└────────────────────────────────────────────────────────────────────┘
+NORMAL · chat │ idle │ session: narrow test │ ○ ws offline │ ctx — Ent
