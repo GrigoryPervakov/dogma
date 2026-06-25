@@ -11,7 +11,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::execute;
 use crossterm::terminal::{
-    EnterAlternateScreen, LeaveAlternateScreen, disable_raw_mode, enable_raw_mode,
+    EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -55,6 +55,18 @@ fn main() -> ExitCode {
         Ok(()) => ExitCode::SUCCESS,
         Err(code) => ExitCode::from(code),
     }
+}
+
+/// The `host:port` of a server URL, for the terminal title — strips the
+/// scheme and any path (`http://127.0.0.1:8900/` → `127.0.0.1:8900`).
+fn host_label(server: &str) -> &str {
+    server
+        .strip_prefix("https://")
+        .or_else(|| server.strip_prefix("http://"))
+        .unwrap_or(server)
+        .split('/')
+        .next()
+        .unwrap_or(server)
 }
 
 async fn run(args: Args, cfg: Config) -> std::result::Result<(), u8> {
@@ -139,7 +151,11 @@ async fn run(args: Args, cfg: Config) -> std::result::Result<(), u8> {
         return Err(2);
     }
     let mut stdout = io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen) {
+    if let Err(e) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        SetTitle(format!("Dogma: {}", host_label(&cfg.server))),
+    ) {
         eprintln!("error: enter alt screen: {e:#}");
         let _ = disable_raw_mode();
         return Err(2);
@@ -477,4 +493,16 @@ fn init_logging(verbose: bool) -> Result<()> {
         "dogma starting"
     );
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::host_label;
+
+    #[test]
+    fn host_label_strips_scheme_and_path() {
+        assert_eq!(host_label("http://127.0.0.1:8900"), "127.0.0.1:8900");
+        assert_eq!(host_label("https://my-dev-vm:8900/"), "my-dev-vm:8900");
+        assert_eq!(host_label("nerve.example.com:443"), "nerve.example.com:443");
+    }
 }

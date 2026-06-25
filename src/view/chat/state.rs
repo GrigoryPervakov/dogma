@@ -653,6 +653,25 @@ impl ChatView {
         self.sessions.iter().position(is_system_session)
     }
 
+    /// Float a user session to the top of the list — most-recent-first, like
+    /// the web. Called when a message is sent, so the chat you just wrote to
+    /// jumps to the top (the next `ListSessions` agrees, since the server bumps
+    /// `updated_at`). System/cron sessions keep their own group ordering.
+    fn bump_session_to_front(&mut self, id: &str) {
+        let Some(pos) = self.sessions.iter().position(|s| s.id == id) else {
+            return;
+        };
+        if is_system_session(&self.sessions[pos]) {
+            return;
+        }
+        if pos != 0 {
+            let session = self.sessions.remove(pos);
+            self.sessions.insert(0, session);
+        }
+        // Sidebar index 0 is "+ new chat", so the front session is at 1.
+        self.sessions_selected = 1;
+    }
+
     pub fn apply_messages_loaded(
         &mut self,
         session_id: &str,
@@ -1420,6 +1439,8 @@ impl ChatView {
                 let ui = self.ui_mut(&key);
                 ui.follow_tail = true;
                 ui.selected_block = Some(last_idx);
+                // Float this chat to the top of the sidebar, as in the web.
+                self.bump_session_to_front(&id);
                 self.drafts.clear(&self.current);
                 self.input = TextArea::default();
                 self.input
@@ -2043,6 +2064,30 @@ mod tests {
             actions
                 .iter()
                 .any(|a| matches!(a, Action::Http(HttpReq::GetMessages { .. })))
+        );
+    }
+
+    /// Sending a message floats that chat to the top of the sidebar list.
+    #[test]
+    fn sending_floats_session_to_top() {
+        let mut v = ChatView::new();
+        v.sessions = ["a", "b", "c"]
+            .iter()
+            .map(|id| serde_json::from_value(serde_json::json!({ "id": id })).unwrap())
+            .collect();
+        v.current = SessionKey::Real("c".into());
+        v.focus = FocusTier::Insert;
+        v.input = TextArea::new(vec!["hi".into()]);
+
+        let mut actions = Vec::new();
+        v.send_input(&mut ctx(&mut actions));
+
+        assert_eq!(v.sessions[0].id, "c", "messaged chat floats to the top");
+        assert_eq!(v.sessions_selected, 1);
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Ws(WsClientMsg::Message { .. })))
         );
     }
 }

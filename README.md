@@ -2,15 +2,9 @@
 
 A terminal UI for [Nerve](https://github.com/ClickHouse/nerve) — drive your agent sessions from the comfort of a TUI.
 
-```
-┌ chat ─────────────────────────────────────────────────┐
-│ assistant · 14:32 · text                              │
-│ Consistent in 12 of 13 sites. The outlier is …        │
-│ ▸ tool:Bash · cargo check                             │
-├ tasks ────────────────────────────────────────────────┤
-│ ✓ Read the spec     ◐ Writing the parser        ○ …   │
-└───────────────────────────────────────────────────────┘
-```
+![dogma — a terminal UI for Nerve](https://grigorypervakov.github.io/dogma/dogma.png)
+
+<sub>Rendered with fake, anonymized data via `cargo run --example screenshot` (the same `TestBackend` the snapshot tests use). The image is rebuilt from the real UI on every push by the [screenshot workflow](.github/workflows/screenshot.yml) and published to GitHub Pages — it is never committed to the repo.</sub>
 
 ## Features
 
