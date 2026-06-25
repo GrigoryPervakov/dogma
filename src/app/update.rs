@@ -15,7 +15,15 @@ pub fn update(app: &mut App, event: AppEvent) -> Vec<Action> {
 
     match event {
         AppEvent::Tick => {
-            // Tick re-renders for spinners; nothing to dispatch.
+            // Re-render for spinners, and let the chat watchdog resync a
+            // session that's gone quiet mid-stream.
+            let ws_connected = matches!(app.ws, WsConnState::Connected);
+            if let Some(view) = chat_view_mut(app) {
+                let mut ctx = ViewCtx {
+                    app_actions: &mut actions,
+                };
+                view.tick_watchdog(ws_connected, &mut ctx);
+            }
             app.mark_dirty();
         }
         AppEvent::Term(TermEvent::Key(k)) => {
@@ -263,6 +271,20 @@ fn handle_http(app: &mut App, res: crate::api::types::HttpResult) -> Vec<Action>
                 view.apply_dismissed(&id, result);
             }
         }
+        HttpResultKind::ModifiedFiles { session_id, result } => {
+            if let Some(view) = chat_view_mut(app) {
+                view.apply_modified_files(&session_id, result);
+            }
+        }
+        HttpResultKind::FileDiff {
+            session_id: _,
+            path,
+            result,
+        } => {
+            if let Some(view) = chat_view_mut(app) {
+                view.apply_file_diff(&path, result);
+            }
+        }
     }
     actions
 }
@@ -351,5 +373,27 @@ mod tests {
         let mut app = app_with_chat_focus(FocusTier::ChatBlocks);
         update(&mut app, char_key('?'));
         assert!(matches!(app.mode, Mode::Help));
+    }
+
+    #[test]
+    fn input_tier_keeps_global_commands() {
+        // `:` / `?` / `q` remain global commands on the focused input.
+        let mut app = app_with_chat_focus(FocusTier::Input);
+        update(&mut app, char_key(':'));
+        assert!(matches!(app.mode, Mode::Command));
+        assert!(matches!(
+            chat_view_mut(&mut app).unwrap().focus,
+            FocusTier::Input
+        ));
+    }
+
+    #[test]
+    fn input_tier_unmapped_char_starts_typing() {
+        // A char no global shortcut claims enters insert and types itself.
+        let mut app = app_with_chat_focus(FocusTier::Input);
+        update(&mut app, char_key('h'));
+        let chat = chat_view_mut(&mut app).unwrap();
+        assert!(matches!(chat.focus, FocusTier::Insert));
+        assert_eq!(chat.input.lines().join("\n"), "h");
     }
 }

@@ -2,6 +2,7 @@
 
 pub mod blocks;
 pub mod blocks_height_estimator;
+mod files;
 pub mod items;
 pub mod poll;
 mod reducer;

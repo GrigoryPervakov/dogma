@@ -1,6 +1,6 @@
 ---
 source: tests/render.rs
-assertion_line: 410
+assertion_line: 408
 expression: "render_buf(&mut app, 100, 24)"
 ---
 dogma   chat    notifs   [tasks]   plans    skills    cron    sources    memory    diag             
@@ -16,14 +16,14 @@ Tasks (3)                           # Fix flaky webhook test
                                    │                                                                
                                    │The webhook test fails ~30% of runs:                            
                                    │                                                                
-                                   │┌─ code ─                                                       
-                                   ││ --- FAIL: TestWebhookFlow                                     
-                                   │└────────────────────────────────────────                       
+                                   │┌─ code ────────────────────┐                                   
+                                   │├───────────────────────────┤                                   
+                                   ││ --- FAIL: TestWebhookFlow │                                   
+                                   │└───────────────────────────┘                                   
                                    │Plan                                                            
                                    │                                                                
                                    │• [ ] Check timing assumptions                                  
                                    │• [ ] Add retry on transient errors                             
-                                   │                                                                
                                    │                                                                
                                    │                                                                
 NORMAL · tasks │ ○ ws offline                  ↑↓/jk move · Enter open · r refresh · Tab switch tab

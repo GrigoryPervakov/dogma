@@ -280,10 +280,19 @@ fn right_hint(app: &App) -> String {
         Mode::Help => "press any key".into(),
         Mode::Normal => {
             if active_view_is_chat(app) {
+                let plan_pending = chat_view(app)
+                    .map(|c| c.active_plan().is_some())
+                    .unwrap_or(false);
                 match chat_view(app).map(|c| c.focus) {
                     Some(FocusTier::Sessions) => "Enter open · / search · ? help · q quit".into(),
+                    Some(FocusTier::ChatBlocks) if plan_pending => {
+                        "a approve · d decline · ↑↓ scroll plan · Enter expand".into()
+                    }
                     Some(FocusTier::ChatBlocks) => {
                         "Enter expand · Esc back · / find · i input".into()
+                    }
+                    Some(FocusTier::BlockInterior) if plan_pending => {
+                        "a approve · d decline · ↑↓/jk scroll · Esc back".into()
                     }
                     Some(FocusTier::BlockInterior) => "↑↓/jk move · g/G top/bot · Esc back".into(),
                     Some(FocusTier::Input) => "Enter type · ↑/Esc back".into(),
@@ -291,6 +300,7 @@ fn right_hint(app: &App) -> String {
                     Some(FocusTier::Poll) => {
                         "↑↓ move · Space select · Enter submit · Esc skip".into()
                     }
+                    Some(FocusTier::Files) => "↑↓ files · Enter diff · Esc back".into(),
                     None => "press : for command, ? for help".into(),
                 }
             } else {
@@ -324,6 +334,7 @@ fn mode_label(app: &App) -> String {
                     FocusTier::Input => "input",
                     FocusTier::Insert => return "INSERT".into(),
                     FocusTier::Poll => return "POLL".into(),
+                    FocusTier::Files => return "FILES".into(),
                 };
                 return format!("NORMAL · {tier}");
             }

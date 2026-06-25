@@ -49,6 +49,16 @@ impl TextArea {
         &self.lines
     }
 
+    /// Cursor is on the first (top) line — an Up here has nowhere to go.
+    pub fn at_top_line(&self) -> bool {
+        self.row == 0
+    }
+
+    /// Cursor is at the very start of the text (row 0, col 0).
+    pub fn at_start(&self) -> bool {
+        self.row == 0 && self.col == 0
+    }
+
     pub fn set_cursor_style(&mut self, s: Style) {
         self.cursor_style = s;
     }
@@ -72,9 +82,17 @@ impl TextArea {
             KeyCode::Char('a') if ctrl => self.col = 0,
             KeyCode::Char('e') if ctrl => self.col = char_count(&self.lines[self.row]),
             KeyCode::Char('k') if ctrl => self.delete_to_line_end(),
+            // Option/Alt word motion: terminals send it either as Left/Right
+            // with the ALT modifier or, more commonly (Ghostty/iTerm "natural
+            // text editing"), as Meta-b / Meta-f (`ESC b` / `ESC f`).
+            KeyCode::Char('b') if alt => self.move_word_left(),
+            KeyCode::Char('f') if alt => self.move_word_right(),
+            KeyCode::Backspace if alt => self.delete_word_back(),
             KeyCode::Backspace => self.backspace(),
             KeyCode::Delete => self.delete_forward(),
+            KeyCode::Left if alt => self.move_word_left(),
             KeyCode::Left => self.move_left(),
+            KeyCode::Right if alt => self.move_word_right(),
             KeyCode::Right => self.move_right(),
             KeyCode::Up => self.move_up(),
             KeyCode::Down => self.move_down(),
@@ -200,6 +218,43 @@ impl TextArea {
         }
     }
 
+    /// Move to the start of the previous word (skip whitespace, then the word).
+    /// At the line start, step to the end of the previous line.
+    fn move_word_left(&mut self) {
+        if self.col == 0 {
+            self.move_left();
+            return;
+        }
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let mut c = self.col;
+        while c > 0 && chars[c - 1].is_whitespace() {
+            c -= 1;
+        }
+        while c > 0 && !chars[c - 1].is_whitespace() {
+            c -= 1;
+        }
+        self.col = c;
+    }
+
+    /// Move to the end of the next word (skip whitespace, then the word).
+    /// At the line end, step to the start of the next line.
+    fn move_word_right(&mut self) {
+        let chars: Vec<char> = self.lines[self.row].chars().collect();
+        let len = chars.len();
+        if self.col >= len {
+            self.move_right();
+            return;
+        }
+        let mut c = self.col;
+        while c < len && chars[c].is_whitespace() {
+            c += 1;
+        }
+        while c < len && !chars[c].is_whitespace() {
+            c += 1;
+        }
+        self.col = c;
+    }
+
     fn move_up(&mut self) {
         if self.row > 0 {
             self.row -= 1;
@@ -272,6 +327,43 @@ mod tests {
 
     fn k(code: KeyCode) -> KeyEvent {
         KeyEvent::new(code, KeyModifiers::NONE)
+    }
+
+    fn alt(code: KeyCode) -> KeyEvent {
+        KeyEvent::new(code, KeyModifiers::ALT)
+    }
+
+    #[test]
+    fn alt_left_right_word_navigation() {
+        let mut ta = TextArea::new(vec!["foo bar baz".into()]);
+        // Cursor starts at the end (col 11).
+        ta.input(alt(KeyCode::Left));
+        assert_eq!(ta.col, 8, "to start of baz");
+        ta.input(alt(KeyCode::Left));
+        assert_eq!(ta.col, 4, "to start of bar");
+        ta.input(alt(KeyCode::Right));
+        assert_eq!(ta.col, 7, "to end of bar");
+    }
+
+    /// Meta-b / Meta-f encoding (Ghostty/iTerm send Option+arrows this way).
+    #[test]
+    fn alt_b_f_word_navigation() {
+        let mut ta = TextArea::new(vec!["foo bar baz".into()]);
+        ta.input(alt(KeyCode::Char('b')));
+        assert_eq!(ta.col, 8, "to start of baz");
+        ta.input(alt(KeyCode::Char('b')));
+        assert_eq!(ta.col, 4, "to start of bar");
+        ta.input(alt(KeyCode::Char('f')));
+        assert_eq!(ta.col, 7, "to end of bar");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_word() {
+        let mut ta = TextArea::new(vec!["foo bar baz".into()]);
+        ta.input(alt(KeyCode::Backspace));
+        assert_eq!(ta.lines(), &["foo bar ".to_string()]);
+        ta.input(alt(KeyCode::Backspace));
+        assert_eq!(ta.lines(), &["foo ".to_string()]);
     }
 
     #[test]

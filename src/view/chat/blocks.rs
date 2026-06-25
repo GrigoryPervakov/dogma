@@ -51,16 +51,22 @@ pub fn render_item(
     }
 
     let title = item_title(item, selection, 0);
-    let (border_type, border_style) = match selection {
-        BlockSelection::Selected | BlockSelection::SelectedInterior => {
-            (BorderType::Thick, Style::default().fg(Color::Cyan))
+    let (border_type, border_style) = if is_plan_block(item.block()) {
+        // Plan-mode blocks always wear a magenta frame so the pending decision
+        // stands out from ordinary blocks (selection still shows via the ▶).
+        (BorderType::Thick, Style::default().fg(Color::Magenta))
+    } else {
+        match selection {
+            BlockSelection::Selected | BlockSelection::SelectedInterior => {
+                (BorderType::Thick, Style::default().fg(Color::Cyan))
+            }
+            // User messages get a distinct colored frame so they stand out from
+            // the assistant's blocks.
+            BlockSelection::None if matches!(item.msg.role, Role::User) => {
+                (BorderType::Plain, theme::role_user())
+            }
+            BlockSelection::None => (BorderType::Plain, Style::default()),
         }
-        // User messages get a distinct colored frame so they stand out from
-        // the assistant's blocks.
-        BlockSelection::None if matches!(item.msg.role, Role::User) => {
-            (BorderType::Plain, theme::role_user())
-        }
-        BlockSelection::None => (BorderType::Plain, Style::default()),
     };
 
     let inner_w = area.width.saturating_sub(2).max(1);
@@ -138,9 +144,23 @@ pub fn compact_content_lines(
 }
 
 /// Tool-call and thinking blocks collapse to a header-only card in the
-/// compact (idle) view.
+/// compact view — except plan-mode blocks, which stay expanded so the plan and
+/// its approve/decline prompt are always visible in the stream.
 pub fn is_collapsible(b: &Block) -> bool {
-    matches!(b, Block::Thinking { .. } | Block::ToolCall(_))
+    match b {
+        Block::Thinking { .. } => true,
+        Block::ToolCall(tc) => !is_plan_tool(&tc.tool),
+        _ => false,
+    }
+}
+
+fn is_plan_tool(tool: &str) -> bool {
+    matches!(tool, "ExitPlanMode" | "EnterPlanMode")
+}
+
+/// A plan-mode approval block — gets a distinct frame in the message list.
+pub fn is_plan_block(b: &Block) -> bool {
+    matches!(b, Block::ToolCall(tc) if is_plan_tool(&tc.tool))
 }
 
 /// A line with no visible glyphs (empty or all-whitespace spans).
@@ -349,9 +369,67 @@ fn render_toolcall(tc: &ToolCall, streaming: bool, full: bool) -> Vec<Line<'stat
         "Edit" => return render_edit_call(tc, full),
         "MultiEdit" => return render_multiedit_call(tc, full),
         "AskUserQuestion" => return render_question_call(tc, streaming, full),
+        "ExitPlanMode" | "EnterPlanMode" => return render_plan_call(tc),
         _ => {}
     }
     render_default_call(tc, streaming, full)
+}
+
+/// A plan-mode block: the plan markdown plus an approve/decline prompt while the
+/// interaction is still pending. Rendered expanded (not collapsed) so the plan
+/// is always readable in the message stream — the user answers with `a`/`d`.
+fn render_plan_call(tc: &ToolCall) -> Vec<Line<'static>> {
+    let is_exit = tc.tool == "ExitPlanMode";
+    let pending = tc.result.is_none();
+    let mut out = vec![Line::from(Span::styled(
+        if is_exit {
+            "▸ plan ready for approval"
+        } else {
+            "▸ wants to enter plan mode"
+        },
+        Style::default()
+            .fg(Color::Magenta)
+            .add_modifier(Modifier::BOLD),
+    ))];
+    match tc.input.get("plan").and_then(|v| v.as_str()) {
+        Some(plan) if !plan.is_empty() => {
+            out.push(Line::raw(""));
+            out.extend(render_markdown(plan));
+        }
+        _ if !is_exit => out.push(Line::from(Span::styled(
+            "The agent will explore the codebase and design an approach for approval.",
+            Style::default().add_modifier(Modifier::DIM),
+        ))),
+        _ => {}
+    }
+    out.push(Line::raw(""));
+    if pending {
+        out.push(Line::from(vec![
+            Span::styled(
+                "[a]",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" approve    "),
+            Span::styled(
+                "[d]",
+                Style::default().fg(Color::Red).add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" decline"),
+        ]));
+    } else {
+        let (glyph, label, color) = if tc.is_error {
+            ("✗", "declined", Color::Red)
+        } else {
+            ("✓", "approved", Color::Green)
+        };
+        out.push(Line::from(Span::styled(
+            format!("{glyph} {label}"),
+            Style::default().fg(color),
+        )));
+    }
+    out
 }
 
 /// Read-only poll summary for an `AskUserQuestion` tool-call in history:
@@ -742,8 +820,9 @@ fn format_timestamp(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::{
-        compact_content_lines, first_line_of_input, full_input_text, line_is_blank,
-        render_default_call, strip_trailing_blank_lines, summarize_input,
+        compact_content_lines, first_line_of_input, full_input_text, is_collapsible, is_plan_block,
+        line_is_blank, render_default_call, render_toolcall, strip_trailing_blank_lines,
+        summarize_input,
     };
     use crate::model::{Block, ToolCall, ToolCallStatus};
     use ratatui::text::Line;
@@ -767,6 +846,23 @@ mod tests {
             status: ToolCallStatus::Complete,
             parent_tool_use_id: None,
         }
+    }
+
+    #[test]
+    fn plan_block_is_expanded_and_renders_plan_and_prompt() {
+        let mut tc = bash("ignored");
+        tc.tool = "ExitPlanMode".into();
+        tc.input = serde_json::json!({ "plan": "# Plan\n- step one" });
+        tc.result = None; // still pending
+        let block = Block::ToolCall(tc.clone());
+        assert!(is_plan_block(&block));
+        assert!(!is_collapsible(&block), "plan blocks render expanded");
+        let text = render_text(&render_toolcall(&tc, false, false));
+        assert!(text.contains("plan ready for approval"));
+        assert!(text.contains("step one"), "plan markdown shown");
+        assert!(text.contains("approve") && text.contains("decline"));
+        // A regular tool call is neither a plan block nor expanded.
+        assert!(!is_plan_block(&Block::ToolCall(bash("ls"))));
     }
 
     #[test]

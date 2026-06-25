@@ -111,6 +111,12 @@ struct NotificationsResp {
     notifications: Vec<Notification>,
 }
 
+#[derive(Debug, Deserialize)]
+struct ModifiedFilesResp {
+    #[serde(default)]
+    files: Vec<crate::model::ModifiedFile>,
+}
+
 fn build_inner() -> Result<Client> {
     Client::builder()
         .user_agent(concat!("dogma/", env!("CARGO_PKG_VERSION")))
@@ -341,6 +347,36 @@ impl HttpClient {
             .await
             .context("POST /api/notifications/{id}/dismiss")?;
         ensure_ok(&resp, "dismiss notification")
+    }
+
+    // -------------------------------------------------------------------
+    // Session file changes — modified-files list + per-file diff.
+    // -------------------------------------------------------------------
+
+    pub async fn modified_files(
+        &self,
+        session_id: &str,
+    ) -> Result<Vec<crate::model::ModifiedFile>> {
+        Ok(self
+            .get_json::<ModifiedFilesResp>(
+                &format!("/api/sessions/{session_id}/modified-files"),
+                "modified files",
+            )
+            .await?
+            .files)
+    }
+
+    pub async fn file_diff(&self, session_id: &str, path: &str) -> Result<crate::model::FileDiff> {
+        let url = self.url(&format!("/api/sessions/{session_id}/file-diff"));
+        let path = path.to_string();
+        let resp = self
+            .send(move |c| c.get(url.as_str()).query(&[("path", path.as_str())]))
+            .await
+            .context("GET /api/sessions/{id}/file-diff")?;
+        ensure_ok(&resp, "file diff")?;
+        resp.json::<crate::model::FileDiff>()
+            .await
+            .context("parse file diff")
     }
 }
 

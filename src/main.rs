@@ -412,6 +412,32 @@ fn spawn_http_worker(
                         }))
                         .await;
                 }
+                Action::Http(HttpReq::GetModifiedFiles { session_id }) => {
+                    let result = http
+                        .modified_files(&session_id)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = event_tx
+                        .send(AppEvent::Http(HttpResult {
+                            kind: HttpResultKind::ModifiedFiles { session_id, result },
+                        }))
+                        .await;
+                }
+                Action::Http(HttpReq::GetFileDiff { session_id, path }) => {
+                    let result = http
+                        .file_diff(&session_id, &path)
+                        .await
+                        .map_err(|e| format!("{e:#}"));
+                    let _ = event_tx
+                        .send(AppEvent::Http(HttpResult {
+                            kind: HttpResultKind::FileDiff {
+                                session_id,
+                                path,
+                                result,
+                            },
+                        }))
+                        .await;
+                }
                 Action::Ws(msg) => {
                     let _ = ws_tx.send(msg).await;
                 }

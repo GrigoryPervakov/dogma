@@ -27,6 +27,8 @@ pub enum FocusTier {
     Insert,
     /// Answering a pending `AskUserQuestion` poll.
     Poll,
+    /// Browsing the session's changed-files list / a file diff.
+    Files,
 }
 
 // ---------------------------------------------------------------------------
@@ -244,6 +246,8 @@ pub enum SessionRuntime {
     Idle,
     Streaming,
     WaitingPoll,
+    /// Paused on an `EnterPlanMode`/`ExitPlanMode` approval.
+    WaitingPlan,
 }
 
 // ---------------------------------------------------------------------------
@@ -285,6 +289,19 @@ pub struct ChatView {
     // Interaction ids already answered/denied — guards against a resolved
     // poll being resurrected when buffered events replay on session re-entry.
     pub answered_interactions: std::collections::HashSet<String>,
+
+    // Changed files per session (from `/modified-files`, refreshed on the
+    // FileChanged WS event). Browsed in the Files tier.
+    pub modified_files: HashMap<String, Vec<crate::model::ModifiedFile>>,
+    pub files_selected: usize,
+    pub files_loading: bool,
+    /// The diff currently open in the Files tier, plus its scroll offset.
+    pub open_diff: Option<crate::model::FileDiff>,
+    pub diff_scroll: usize,
+
+    // Wall-clock of the last WS event per session — drives the stall watchdog
+    // that resyncs a session gone quiet mid-stream.
+    pub last_activity: HashMap<String, std::time::Instant>,
 
     // run_in_background jobs per session (from BackgroundTasksUpdate WS events).
     pub background_tasks: HashMap<String, Vec<serde_json::Value>>,
@@ -328,6 +345,12 @@ impl ChatView {
             pending_interaction: HashMap::new(),
             poll_ui: None,
             answered_interactions: std::collections::HashSet::new(),
+            modified_files: HashMap::new(),
+            files_selected: 0,
+            files_loading: false,
+            open_diff: None,
+            diff_scroll: 0,
+            last_activity: HashMap::new(),
             background_tasks: HashMap::new(),
             context: HashMap::new(),
             sessions_loaded: false,
@@ -346,13 +369,14 @@ impl ChatView {
     /// Coarse runtime state of a session: waiting on a poll, actively
     /// streaming, or idle.
     pub fn session_runtime(&self, session_id: &str) -> SessionRuntime {
-        let waiting = self
+        match self
             .pending_interaction
             .get(session_id)
-            .map(|p| p.interaction_type == "question")
-            .unwrap_or(false);
-        if waiting {
-            return SessionRuntime::WaitingPoll;
+            .map(|p| p.interaction_type.as_str())
+        {
+            Some("question") => return SessionRuntime::WaitingPoll,
+            Some("plan_enter") | Some("plan_exit") => return SessionRuntime::WaitingPlan,
+            _ => {}
         }
         let running = self
             .sessions
@@ -379,6 +403,38 @@ impl ChatView {
         self.current_session_id()
             .map(|id| matches!(self.session_runtime(id), SessionRuntime::Streaming))
             .unwrap_or(false)
+    }
+
+    /// Called on every UI tick: if the current session looks like it's
+    /// streaming but no WS event has arrived in a while, resync it with the
+    /// server. Non-destructive — the `SessionStatus` reply rebuilds a running
+    /// turn or heals a finished one (a lost Done leaves a chat stuck).
+    pub fn tick_watchdog(&mut self, ws_connected: bool, ctx: &mut ViewCtx) {
+        const STALL: std::time::Duration = std::time::Duration::from_secs(60);
+        if !ws_connected || !self.is_current_streaming() {
+            return;
+        }
+        let Some(id) = self.current_session_id().map(str::to_string) else {
+            return;
+        };
+        let stale = self
+            .last_activity
+            .get(&id)
+            .map(|t| t.elapsed() >= STALL)
+            .unwrap_or(true);
+        if !stale {
+            return;
+        }
+        // Debounce — resync at most once per stall window.
+        self.last_activity
+            .insert(id.clone(), std::time::Instant::now());
+        ctx.push(Action::Ws(WsClientMsg::SwitchSession {
+            session_id: id.clone(),
+        }));
+        ctx.push(Action::Http(HttpReq::GetMessages {
+            session_id: id,
+            limit: INITIAL_HISTORY_LIMIT,
+        }));
     }
 
     pub fn current_history(&self) -> &[Message] {
@@ -489,7 +545,10 @@ impl ChatView {
                 // events to us. Actual buffered_events come back in
                 // session_status.
                 // (Push via the ctx in run_command / handle_key paths.)
-                let _ = id; // queued by callers
+                // Start the stall-watchdog clock when a session first appears.
+                self.last_activity
+                    .entry(id.clone())
+                    .or_insert_with(std::time::Instant::now);
             }
             SessionKey::NewChat => { /* nothing remote yet */ }
         }
@@ -524,6 +583,39 @@ impl ChatView {
             }
             ChatCommand::Rename(_) => { /* TODO PATCH /api/sessions/{id} */ }
             ChatCommand::Delete => { /* TODO DELETE /api/sessions/{id} */ }
+            ChatCommand::Reload => {
+                if let Some(id) = self.current_session_id().map(str::to_string) {
+                    // Drop every local cache for this session — an orphaned
+                    // streaming buffer or a non-Idle agent_status (from a lost
+                    // Done/Stopped) is exactly what gets a chat "stuck".
+                    self.streaming.remove(&id);
+                    self.agent_status.insert(id.clone(), AgentStatus::Idle);
+                    self.history.remove(&id);
+                    self.history_load.remove(&id);
+                    self.pending_interaction.remove(&id);
+                    self.modified_files.remove(&id);
+                    self.open_diff = None;
+                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                        s.is_running = false;
+                    }
+                    self.poll_ui = None;
+                    if matches!(self.focus, FocusTier::Poll | FocusTier::Files) {
+                        self.focus = FocusTier::ChatBlocks;
+                    }
+                    // Re-route events and refetch canonical history.
+                    out.push(Action::Ws(WsClientMsg::SwitchSession {
+                        session_id: id.clone(),
+                    }));
+                    out.push(Action::Http(HttpReq::GetMessages {
+                        session_id: id.clone(),
+                        limit: INITIAL_HISTORY_LIMIT,
+                    }));
+                    let entry = self.history_load.entry(id).or_default();
+                    entry.limit = INITIAL_HISTORY_LIMIT;
+                    entry.loading = true;
+                    entry.exhausted = false;
+                }
+            }
         }
         out
     }
@@ -825,14 +917,18 @@ impl ChatView {
                     session_id: id.clone(),
                 }));
                 self.ensure_history_fetch(id, ctx);
-                // Existing chats always land in ChatBlocks — only the
-                // new-chat row jumps to Insert. A session waiting on a poll
-                // jumps straight to answering it.
-                self.focus = FocusTier::ChatBlocks;
+                // Land on the input box, ready to type — unless the agent is
+                // mid-stream (input is hidden) in which case browse the blocks.
+                // A pending poll/plan overrides below.
+                self.focus = if self.is_current_streaming() {
+                    FocusTier::ChatBlocks
+                } else {
+                    FocusTier::Input
+                };
                 // Cached session: jump to the latest unless the user is pinned
                 // up-thread. (Uncached: handled on history load.)
                 self.scroll_to_latest_unless_pinned(id);
-                self.focus_poll_if_pending();
+                self.focus_interaction_if_pending();
             }
             SessionKey::NewChat => {
                 self.focus = FocusTier::Insert;
@@ -866,6 +962,14 @@ impl ChatView {
 
     fn enter_insert(&mut self) {
         self.focus = FocusTier::Insert;
+    }
+
+    /// Leave the editor for the message list, landing on the block directly
+    /// above the input (the latest one). The draft is preserved.
+    fn exit_insert_to_blocks(&mut self) {
+        self.save_draft();
+        self.focus = FocusTier::ChatBlocks;
+        self.jump_last();
     }
 
     // ---- Pending poll (AskUserQuestion) --------------------------------
@@ -926,10 +1030,160 @@ impl ChatView {
         }
     }
 
-    /// Move focus to the pending poll if one is waiting for this session.
-    fn focus_poll_if_pending(&mut self) {
+    /// Move focus to the poll waiting for this session, if any. A pending plan
+    /// does NOT grab focus — it lives as the latest block and is answered with
+    /// `a`/`d` from the message list, so navigation is never trapped.
+    pub fn focus_interaction_if_pending(&mut self) {
         if self.active_poll().is_some() {
             self.focus = FocusTier::Poll;
+        }
+    }
+
+    /// The pending `EnterPlanMode`/`ExitPlanMode` interaction the user can
+    /// approve right now for the current session, if any.
+    pub fn active_plan(&self) -> Option<&PendingInteraction> {
+        let sid = self.current_session_id()?;
+        let p = self.pending_interaction.get(sid)?;
+        (matches!(p.interaction_type.as_str(), "plan_enter" | "plan_exit")
+            && !self.answered_interactions.contains(&p.interaction_id))
+        .then_some(p)
+    }
+
+    /// Answer the pending plan (`a` approve / `d` decline). No-op without one.
+    fn answer_plan(&mut self, approved: bool, ctx: &mut ViewCtx) {
+        let Some(p) = self.active_plan() else {
+            return;
+        };
+        let Some(sid) = self.current_session_id().map(str::to_string) else {
+            return;
+        };
+        let interaction_id = p.interaction_id.clone();
+        self.answered_interactions.insert(interaction_id.clone());
+        ctx.push(Action::Ws(WsClientMsg::AnswerInteraction {
+            session_id: sid.clone(),
+            interaction_id,
+            result: None,
+            denied: !approved,
+            message: (!approved).then(|| "User declined.".to_string()),
+        }));
+        self.pending_interaction.remove(&sid);
+        self.jump_last();
+    }
+
+    // ----- Changed files / diff viewer ----------------------------------
+
+    /// The current session's changed-files list.
+    pub fn current_modified_files(&self) -> &[crate::model::ModifiedFile] {
+        self.current_session_id()
+            .and_then(|id| self.modified_files.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
+    }
+
+    /// Open the Files tier and (re)fetch the changed-files list.
+    fn open_files_panel(&mut self, ctx: &mut ViewCtx) {
+        let Some(id) = self.current_session_id().map(str::to_string) else {
+            return;
+        };
+        self.focus = FocusTier::Files;
+        self.open_diff = None;
+        self.diff_scroll = 0;
+        self.files_selected = self
+            .files_selected
+            .min(self.current_modified_files().len().saturating_sub(1));
+        self.files_loading = true;
+        ctx.push(Action::Http(HttpReq::GetModifiedFiles { session_id: id }));
+    }
+
+    /// Refresh the changed-files list for a session if it's already tracked —
+    /// used to react to FileChanged events without grabbing focus.
+    pub fn refresh_modified_files(&mut self, session_id: &str, ctx: &mut ViewCtx) {
+        if self.modified_files.contains_key(session_id) {
+            ctx.push(Action::Http(HttpReq::GetModifiedFiles {
+                session_id: session_id.to_string(),
+            }));
+        }
+    }
+
+    pub fn apply_modified_files(
+        &mut self,
+        session_id: &str,
+        result: std::result::Result<Vec<crate::model::ModifiedFile>, String>,
+    ) {
+        self.files_loading = false;
+        match result {
+            Ok(files) => {
+                self.files_selected = self.files_selected.min(files.len().saturating_sub(1));
+                self.modified_files.insert(session_id.to_string(), files);
+            }
+            Err(e) => self.last_error = Some(format!("modified-files: {e}")),
+        }
+    }
+
+    pub fn apply_file_diff(
+        &mut self,
+        _path: &str,
+        result: std::result::Result<crate::model::FileDiff, String>,
+    ) {
+        match result {
+            Ok(diff) => {
+                self.open_diff = Some(diff);
+                self.diff_scroll = 0;
+            }
+            Err(e) => self.last_error = Some(format!("file-diff: {e}")),
+        }
+    }
+
+    fn keys_files(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
+        // A diff is open → scroll it; Esc/← drops back to the file list.
+        if self.open_diff.is_some() {
+            match key.code {
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                    self.open_diff = None;
+                    self.diff_scroll = 0;
+                }
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.diff_scroll = self.diff_scroll.saturating_add(1);
+                }
+                KeyCode::Up | KeyCode::Char('k') => {
+                    self.diff_scroll = self.diff_scroll.saturating_sub(1);
+                }
+                KeyCode::PageDown => self.diff_scroll = self.diff_scroll.saturating_add(10),
+                KeyCode::PageUp => self.diff_scroll = self.diff_scroll.saturating_sub(10),
+                KeyCode::Char('g') | KeyCode::Home => self.diff_scroll = 0,
+                _ => {}
+            }
+            return;
+        }
+        let n = self.current_modified_files().len();
+        match key.code {
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') | KeyCode::Char('q') => {
+                self.focus = FocusTier::ChatBlocks;
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.files_selected + 1 < n {
+                    self.files_selected += 1;
+                }
+            }
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.files_selected = self.files_selected.saturating_sub(1);
+            }
+            KeyCode::Char('r') => self.open_files_panel(ctx),
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                let target = self
+                    .current_modified_files()
+                    .get(self.files_selected)
+                    .map(|f| f.path.clone());
+                if let (Some(path), Some(id)) =
+                    (target, self.current_session_id().map(str::to_string))
+                {
+                    ctx.push(Action::Http(HttpReq::GetFileDiff {
+                        session_id: id,
+                        path,
+                    }));
+                }
+            }
+            _ => {}
         }
     }
 
@@ -1201,6 +1455,9 @@ pub enum ChatCommand {
     Resume,
     Rename(Option<String>),
     Delete,
+    /// Rebuild the current session's state from scratch (drops local caches,
+    /// re-switches, refetches) — clears a stuck stream.
+    Reload,
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,9 +1472,14 @@ impl View for ChatView {
         "chat"
     }
     fn consumes_global_shortcuts(&self) -> bool {
-        // While typing or answering a poll, the view owns every key —
-        // global `q` / `?` / `:` must not fire.
-        matches!(self.focus, FocusTier::Insert | FocusTier::Poll)
+        // While actively typing or answering a poll, the view owns every key.
+        // NOT on the focused-but-idle input: there `q`/`?`/`:` stay global
+        // commands, and only the chars they don't claim fall through to start
+        // typing (see `keys_input_focused`).
+        matches!(
+            self.focus,
+            FocusTier::Insert | FocusTier::Poll | FocusTier::Files
+        )
     }
 
     fn handle_key(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
@@ -1228,6 +1490,7 @@ impl View for ChatView {
             FocusTier::Input => self.keys_input_focused(key, ctx),
             FocusTier::Insert => self.keys_insert(key, ctx),
             FocusTier::Poll => self.keys_poll(key, ctx),
+            FocusTier::Files => self.keys_files(key, ctx),
         }
     }
 
@@ -1343,6 +1606,13 @@ impl ChatView {
             (KeyCode::Enter, _) | (KeyCode::Right, _) | (KeyCode::Char('l'), _) => {
                 self.enter_block();
             }
+            // While a plan awaits approval, `a`/`d` answer it from the list.
+            (KeyCode::Char('a'), _) if self.active_plan().is_some() => {
+                self.answer_plan(true, ctx);
+            }
+            (KeyCode::Char('d'), _) if self.active_plan().is_some() => {
+                self.answer_plan(false, ctx);
+            }
             (KeyCode::Char('i'), _) | (KeyCode::Char('a'), _) => {
                 // No text input while the agent streams (input box hidden).
                 if !self.is_current_streaming() {
@@ -1355,19 +1625,26 @@ impl ChatView {
             (KeyCode::Char('p'), KeyModifiers::CONTROL) => {
                 self.side_panel.visible = !self.side_panel.visible;
             }
+            (KeyCode::Char('f'), KeyModifiers::CONTROL) => {
+                self.open_files_panel(ctx);
+            }
             _ => {}
         }
     }
 
-    fn keys_block_interior(&mut self, key: KeyEvent, _ctx: &mut ViewCtx) {
+    fn keys_block_interior(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
         // Keys move a line cursor inside the selected block. The renderer
         // clamps the cursor to [0, total_lines) on each frame; we don't have
         // the block's rendered line count here, so we just nudge by ± and
         // let render normalize.
         const PAGE: usize = 10;
+        // Approve/decline a pending plan while reading it zoomed in.
+        let plan_pending = self.active_plan().is_some();
         let key2 = self.current.clone();
         let ui = self.ui_mut(&key2);
         match (key.code, key.modifiers) {
+            (KeyCode::Char('a'), _) if plan_pending => self.answer_plan(true, ctx),
+            (KeyCode::Char('d'), _) if plan_pending => self.answer_plan(false, ctx),
             (KeyCode::Esc, _) | (KeyCode::Left, _) => {
                 self.pop_from_block();
             }
@@ -1398,16 +1675,20 @@ impl ChatView {
         }
     }
 
-    fn keys_input_focused(&mut self, key: KeyEvent, _ctx: &mut ViewCtx) {
+    fn keys_input_focused(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
         match (key.code, key.modifiers) {
-            (KeyCode::Enter, _) | (KeyCode::Char('i'), _) | (KeyCode::Char('a'), _) => {
-                self.enter_insert();
-            }
             (KeyCode::Esc, _) | (KeyCode::Up, _) | (KeyCode::Left, _) => {
                 self.focus = FocusTier::ChatBlocks;
             }
             (KeyCode::Char('b'), KeyModifiers::CONTROL) => {
                 self.sidebar_visible = !self.sidebar_visible;
+            }
+            (KeyCode::Enter, _) => self.enter_insert(),
+            // Any printable key the global shortcuts don't claim (`q`/`?`/`:`
+            // are intercepted before this) starts editing with that character.
+            (KeyCode::Char(_), m) if !m.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT) => {
+                self.enter_insert();
+                self.keys_insert(key, ctx);
             }
             _ => {}
         }
@@ -1426,6 +1707,17 @@ impl ChatView {
         if matches!(key.code, KeyCode::Esc) {
             self.save_draft();
             self.focus = FocusTier::Input;
+            return;
+        }
+        // Leaving the editor by walking off its top/left edge — Up on the first
+        // line, or plain Left at the very start — drops to the block above the
+        // input. Alt+Left is word-navigation, so it's excluded here.
+        let at_top = matches!(key.code, KeyCode::Up) && self.input.at_top_line();
+        let at_start = matches!(key.code, KeyCode::Left)
+            && !key.modifiers.contains(KeyModifiers::ALT)
+            && self.input.at_start();
+        if at_top || at_start {
+            self.exit_insert_to_blocks();
             return;
         }
         // Note: Ctrl+C is intercepted globally in app/update.rs::handle_key
@@ -1554,5 +1846,203 @@ mod tests {
         let ui = &v.ui[&SessionKey::Real("s1".into())];
         assert_eq!(ui.selected_block, Some(1));
         assert!(!ui.follow_tail);
+    }
+
+    fn plan_pending(v: &mut ChatView, kind: &str) {
+        v.current = SessionKey::Real("s1".into());
+        // The plan no longer steals focus — it's a block in the list answered
+        // from ChatBlocks, so navigation is never trapped.
+        v.focus = FocusTier::ChatBlocks;
+        v.history
+            .insert("s1".into(), vec![assistant_with_blocks("s1", 1)]);
+        v.pending_interaction.insert(
+            "s1".into(),
+            PendingInteraction {
+                session_id: "s1".into(),
+                interaction_id: "pi1".into(),
+                interaction_type: kind.into(),
+                tool_name: "ExitPlanMode".into(),
+                tool_input: serde_json::json!({ "plan": "# Plan\n- step" }),
+            },
+        );
+    }
+
+    /// `a` in ChatBlocks approves a pending plan and clears the interaction.
+    #[test]
+    fn plan_approval_answers_and_clears() {
+        let mut v = ChatView::new();
+        plan_pending(&mut v, "plan_exit");
+        assert!(v.active_plan().is_some());
+
+        let mut actions = Vec::new();
+        v.keys_chatblocks(
+            KeyEvent::new(KeyCode::Char('a'), KeyModifiers::NONE),
+            &mut ctx(&mut actions),
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Ws(WsClientMsg::AnswerInteraction { denied: false, .. })
+        )));
+        assert!(v.active_plan().is_none());
+    }
+
+    /// `d` declines with a message; navigation keys never trigger approval.
+    #[test]
+    fn plan_decline_sends_denied() {
+        let mut v = ChatView::new();
+        plan_pending(&mut v, "plan_enter");
+        let mut actions = Vec::new();
+        v.keys_chatblocks(
+            KeyEvent::new(KeyCode::Char('d'), KeyModifiers::NONE),
+            &mut ctx(&mut actions),
+        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Ws(WsClientMsg::AnswerInteraction {
+                denied: true,
+                message: Some(_),
+                ..
+            })
+        )));
+        assert!(v.active_plan().is_none());
+    }
+
+    /// A session paused on a plan shows the distinct WaitingPlan runtime.
+    #[test]
+    fn pending_plan_marks_session_waiting_plan() {
+        let mut v = ChatView::new();
+        plan_pending(&mut v, "plan_exit");
+        assert_eq!(v.session_runtime("s1"), SessionRuntime::WaitingPlan);
+    }
+
+    /// Navigating (j/k) while a plan is pending does NOT answer it — the user
+    /// can traverse history/other chats without responding.
+    #[test]
+    fn plan_pending_does_not_trap_navigation() {
+        let mut v = ChatView::new();
+        plan_pending(&mut v, "plan_exit");
+        let mut actions = Vec::new();
+        v.keys_chatblocks(
+            KeyEvent::new(KeyCode::Char('k'), KeyModifiers::NONE),
+            &mut ctx(&mut actions),
+        );
+        assert!(
+            !actions
+                .iter()
+                .any(|a| matches!(a, Action::Ws(WsClientMsg::AnswerInteraction { .. }))),
+            "navigation must not answer the plan"
+        );
+        assert!(v.active_plan().is_some(), "plan still pending");
+    }
+
+    /// A printable key on the focused input starts editing and types the char.
+    #[test]
+    fn input_tier_printable_starts_editing_with_char() {
+        let mut v = ChatView::new();
+        v.current = SessionKey::Real("s1".into());
+        v.focus = FocusTier::Input;
+        let mut actions = Vec::new();
+        v.keys_input_focused(
+            KeyEvent::new(KeyCode::Char('h'), KeyModifiers::NONE),
+            &mut ctx(&mut actions),
+        );
+        assert_eq!(v.focus, FocusTier::Insert);
+        assert_eq!(v.input.lines().join("\n"), "h");
+    }
+
+    /// Esc on the focused input backs out to the message list.
+    #[test]
+    fn input_tier_esc_returns_to_blocks() {
+        let mut v = ChatView::new();
+        v.current = SessionKey::Real("s1".into());
+        v.focus = FocusTier::Input;
+        let mut actions = Vec::new();
+        v.keys_input_focused(
+            KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE),
+            &mut ctx(&mut actions),
+        );
+        assert_eq!(v.focus, FocusTier::ChatBlocks);
+    }
+
+    /// Up on the editor's top line exits to the latest block.
+    #[test]
+    fn up_on_top_line_exits_editor_to_blocks() {
+        let mut v = ChatView::new();
+        v.current = SessionKey::Real("s1".into());
+        v.history
+            .insert("s1".into(), vec![assistant_with_blocks("s1", 3)]);
+        v.focus = FocusTier::Insert;
+        v.input = TextArea::new(vec!["hello".into()]);
+        let mut actions = Vec::new();
+        v.keys_insert(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut ctx(&mut actions),
+        );
+        assert_eq!(v.focus, FocusTier::ChatBlocks);
+        assert_eq!(v.ui[&SessionKey::Real("s1".into())].selected_block, Some(2));
+    }
+
+    /// Left at the very start of the editor exits the same way.
+    #[test]
+    fn left_at_start_exits_editor_to_blocks() {
+        let mut v = ChatView::new();
+        v.current = SessionKey::Real("s1".into());
+        v.history
+            .insert("s1".into(), vec![assistant_with_blocks("s1", 2)]);
+        v.focus = FocusTier::Insert;
+        v.input = TextArea::default();
+        let mut actions = Vec::new();
+        v.keys_insert(
+            KeyEvent::new(KeyCode::Left, KeyModifiers::NONE),
+            &mut ctx(&mut actions),
+        );
+        assert_eq!(v.focus, FocusTier::ChatBlocks);
+    }
+
+    /// Up from a lower line keeps editing (cursor just moves up).
+    #[test]
+    fn up_below_top_line_keeps_editing() {
+        let mut v = ChatView::new();
+        v.current = SessionKey::Real("s1".into());
+        v.focus = FocusTier::Insert;
+        v.input = TextArea::new(vec!["one".into(), "two".into()]);
+        let mut actions = Vec::new();
+        v.keys_insert(
+            KeyEvent::new(KeyCode::Up, KeyModifiers::NONE),
+            &mut ctx(&mut actions),
+        );
+        assert_eq!(v.focus, FocusTier::Insert);
+    }
+
+    /// `:reload` drops the stuck stream's local state and refetches.
+    #[test]
+    fn reload_rebuilds_current_session_from_scratch() {
+        let mut v = ChatView::new();
+        v.current = SessionKey::Real("s1".into());
+        v.sessions = vec![
+            serde_json::from_value(serde_json::json!({ "id": "s1", "is_running": true })).unwrap(),
+        ];
+        v.streaming
+            .insert("s1".into(), Message::new_streaming_assistant("s1".into()));
+        v.agent_status.insert("s1".into(), AgentStatus::Writing);
+        v.history
+            .insert("s1".into(), vec![assistant_with_blocks("s1", 2)]);
+
+        let actions = v.run_command(ChatCommand::Reload);
+
+        assert!(!v.streaming.contains_key("s1"), "streaming buffer cleared");
+        assert!(matches!(v.agent_status.get("s1"), Some(AgentStatus::Idle)));
+        assert!(!v.history.contains_key("s1"), "history cleared for refetch");
+        assert!(!v.sessions[0].is_running, "is_running reset");
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Ws(WsClientMsg::SwitchSession { .. })))
+        );
+        assert!(
+            actions
+                .iter()
+                .any(|a| matches!(a, Action::Http(HttpReq::GetMessages { .. })))
+        );
     }
 }

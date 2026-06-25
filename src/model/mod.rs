@@ -1,6 +1,7 @@
 //! Domain model — wire-faithful types for sessions, messages, blocks,
 //! plus the lighter list/detail entities for tasks / plans / skills.
 
+pub mod files;
 pub mod message;
 pub mod notification;
 pub mod plan;
@@ -9,6 +10,7 @@ pub mod skill;
 pub mod task;
 pub mod usage;
 
+pub use files::{FileDiff, ModifiedFile};
 pub use message::{Block, Message, Role, ToolCall, ToolCallStatus};
 pub use notification::Notification;
 pub use plan::Plan;

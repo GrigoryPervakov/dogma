@@ -308,6 +308,14 @@ pub enum HttpReq {
     DismissNotification {
         id: String,
     },
+
+    GetModifiedFiles {
+        session_id: String,
+    },
+    GetFileDiff {
+        session_id: String,
+        path: String,
+    },
 }
 
 /// Body returned from `GET /api/sessions/{id}/messages` after decoding.
@@ -358,5 +366,14 @@ pub enum HttpResultKind {
     NotificationDismissed {
         id: String,
         result: Result<(), String>,
+    },
+    ModifiedFiles {
+        session_id: String,
+        result: Result<Vec<crate::model::ModifiedFile>, String>,
+    },
+    FileDiff {
+        session_id: String,
+        path: String,
+        result: Result<crate::model::FileDiff, String>,
     },
 }

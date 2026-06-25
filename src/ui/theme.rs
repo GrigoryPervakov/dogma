@@ -31,6 +31,13 @@ pub fn session_waiting() -> Style {
     Style::default().fg(Color::Yellow)
 }
 
+/// A session paused on a plan-mode approval — distinct from a question poll.
+pub fn session_waiting_plan() -> Style {
+    Style::default()
+        .fg(Color::Magenta)
+        .add_modifier(Modifier::BOLD)
+}
+
 pub fn nav_active() -> Style {
     Style::default()
         .fg(Color::Cyan)

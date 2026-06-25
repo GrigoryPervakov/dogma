@@ -1,20 +1,37 @@
 //! Markdown renderer — pulldown-cmark walk → ratatui Lines, with syntect
 //! integration for fenced code blocks.
 
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::ui::highlight;
 
 pub fn render_markdown(src: &str) -> Vec<Line<'static>> {
-    let parser = Parser::new(src);
+    // GitHub-flavoured extensions: without these, tables / ~~strike~~ / task
+    // lists never parse and render as raw text.
+    let opts = Options::ENABLE_TABLES
+        | Options::ENABLE_STRIKETHROUGH
+        | Options::ENABLE_TASKLISTS
+        | Options::ENABLE_FOOTNOTES;
+    let parser = Parser::new_ext(src, opts);
     let mut walker = Walker::default();
     for ev in parser {
         walker.handle(ev);
     }
     walker.flush();
     walker.lines
+}
+
+/// Buffered table state — cells stream in as text, rendered as an aligned grid
+/// on `TagEnd::Table`.
+#[derive(Default)]
+struct TableState {
+    alignments: Vec<Alignment>,
+    header: Vec<String>,
+    rows: Vec<Vec<String>>,
+    cur_row: Vec<String>,
+    cur_cell: String,
 }
 
 #[derive(Default)]
@@ -27,6 +44,7 @@ struct Walker {
     code_buf: String,
     list_depth: u8,
     ordered_counters: Vec<u64>,
+    table: Option<TableState>,
 }
 
 impl Walker {
@@ -59,7 +77,9 @@ impl Walker {
             Event::Start(tag) => self.start(tag),
             Event::End(tag_end) => self.end(tag_end),
             Event::Text(t) => {
-                if self.in_code_block {
+                if let Some(tbl) = self.table.as_mut() {
+                    tbl.cur_cell.push_str(&t);
+                } else if self.in_code_block {
                     self.code_buf.push_str(&t);
                 } else {
                     let style = self.cur_style();
@@ -67,10 +87,16 @@ impl Walker {
                 }
             }
             Event::Code(t) => {
-                let s = self
-                    .cur_style()
-                    .patch(Style::default().fg(Color::Yellow).bg(Color::Reset));
-                self.cur.push(Span::styled(format!("`{t}`"), s));
+                if let Some(tbl) = self.table.as_mut() {
+                    tbl.cur_cell.push('`');
+                    tbl.cur_cell.push_str(&t);
+                    tbl.cur_cell.push('`');
+                } else {
+                    let s = self
+                        .cur_style()
+                        .patch(Style::default().fg(Color::Yellow).bg(Color::Reset));
+                    self.cur.push(Span::styled(format!("`{t}`"), s));
+                }
             }
             Event::SoftBreak | Event::HardBreak => {
                 self.newline();
@@ -161,6 +187,28 @@ impl Walker {
                 );
                 self.cur.push(Span::styled(format!("({dest_url})"), s));
             }
+            Tag::Table(aligns) => {
+                self.flush();
+                self.table = Some(TableState {
+                    alignments: aligns,
+                    ..Default::default()
+                });
+            }
+            Tag::TableHead => {
+                if let Some(t) = self.table.as_mut() {
+                    t.cur_row.clear();
+                }
+            }
+            Tag::TableRow => {
+                if let Some(t) = self.table.as_mut() {
+                    t.cur_row.clear();
+                }
+            }
+            Tag::TableCell => {
+                if let Some(t) = self.table.as_mut() {
+                    t.cur_cell.clear();
+                }
+            }
             _ => {}
         }
     }
@@ -184,27 +232,7 @@ impl Walker {
                 let lang = self.code_lang.take();
                 let code = std::mem::take(&mut self.code_buf);
                 self.in_code_block = false;
-
-                self.lines.push(Line::from(Span::styled(
-                    format!("┌─ {} ─", lang.as_deref().unwrap_or("code")),
-                    Style::default().add_modifier(Modifier::DIM),
-                )));
-                let highlighted = highlight::highlight_code(&code, lang.as_deref());
-                for line in highlighted {
-                    let mut spans: Vec<Span<'static>> = Vec::with_capacity(line.spans.len() + 1);
-                    spans.push(Span::styled(
-                        "│ ".to_string(),
-                        Style::default().add_modifier(Modifier::DIM),
-                    ));
-                    for sp in line.spans {
-                        spans.push(Span::styled(sp.content.into_owned(), sp.style));
-                    }
-                    self.lines.push(Line::from(spans));
-                }
-                self.lines.push(Line::from(Span::styled(
-                    "└".to_string() + &"─".repeat(40),
-                    Style::default().add_modifier(Modifier::DIM),
-                )));
+                self.lines.extend(render_code_block(lang.as_deref(), &code));
             }
             TagEnd::List(_) => {
                 self.list_depth = self.list_depth.saturating_sub(1);
@@ -214,7 +242,207 @@ impl Walker {
                 self.flush();
             }
             TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => self.pop_style(),
+            TagEnd::TableCell => {
+                if let Some(t) = self.table.as_mut() {
+                    let cell = std::mem::take(&mut t.cur_cell);
+                    t.cur_row.push(cell.trim().to_string());
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(t) = self.table.as_mut() {
+                    t.header = std::mem::take(&mut t.cur_row);
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(t) = self.table.as_mut() {
+                    let row = std::mem::take(&mut t.cur_row);
+                    if !row.is_empty() {
+                        t.rows.push(row);
+                    }
+                }
+            }
+            TagEnd::Table => {
+                if let Some(t) = self.table.take() {
+                    self.lines.extend(render_table(&t));
+                    self.lines.push(Line::raw(""));
+                }
+            }
             _ => {}
         }
+    }
+}
+
+/// Render a fenced code block as a closed box: a `lang`-labelled top border, a
+/// header separator, syntax-highlighted lines with left+right borders, and a
+/// bottom border. The box grows to the widest line.
+fn render_code_block(lang: Option<&str>, code: &str) -> Vec<Line<'static>> {
+    let highlighted = highlight::highlight_code(code, lang);
+    let label = lang.unwrap_or("code");
+    let line_w = |l: &Line| {
+        l.spans
+            .iter()
+            .map(|s| s.content.chars().count())
+            .sum::<usize>()
+    };
+    // Inner content width — the widest code line, but wide enough for the label.
+    let mut width = label.chars().count() + 1;
+    for l in &highlighted {
+        width = width.max(line_w(l));
+    }
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let mut out = Vec::new();
+    // Top border with the embedded language label: ┌─ rust ───┐
+    let fill = (width + 2).saturating_sub(label.chars().count() + 3);
+    out.push(Line::from(Span::styled(
+        format!("┌─ {label} {}┐", "─".repeat(fill)),
+        dim,
+    )));
+    // Separator line after the header.
+    out.push(Line::from(Span::styled(
+        format!("├{}┤", "─".repeat(width + 2)),
+        dim,
+    )));
+    for l in &highlighted {
+        let pad = width.saturating_sub(line_w(l));
+        let mut spans: Vec<Span<'static>> = Vec::with_capacity(l.spans.len() + 3);
+        spans.push(Span::styled("│ ", dim));
+        for sp in &l.spans {
+            spans.push(Span::styled(sp.content.clone().into_owned(), sp.style));
+        }
+        spans.push(Span::raw(" ".repeat(pad + 1)));
+        spans.push(Span::styled("│", dim));
+        out.push(Line::from(spans));
+    }
+    out.push(Line::from(Span::styled(
+        format!("└{}┘", "─".repeat(width + 2)),
+        dim,
+    )));
+    out
+}
+
+/// Render a buffered table as an aligned, box-drawn grid.
+fn render_table(t: &TableState) -> Vec<Line<'static>> {
+    let ncols = t
+        .header
+        .len()
+        .max(t.rows.iter().map(|r| r.len()).max().unwrap_or(0));
+    if ncols == 0 {
+        return Vec::new();
+    }
+    let mut widths = vec![0usize; ncols];
+    let mut measure = |cells: &[String]| {
+        for (i, c) in cells.iter().enumerate() {
+            if i < ncols {
+                widths[i] = widths[i].max(c.chars().count());
+            }
+        }
+    };
+    measure(&t.header);
+    for r in &t.rows {
+        measure(r);
+    }
+
+    let dim = Style::default().add_modifier(Modifier::DIM);
+    let border = |left: char, mid: char, right: char| -> Line<'static> {
+        let mut s = String::new();
+        s.push(left);
+        for (i, w) in widths.iter().enumerate() {
+            s.push_str(&"─".repeat(w + 2));
+            s.push(if i + 1 < ncols { mid } else { right });
+        }
+        Line::from(Span::styled(s, dim))
+    };
+    let fmt_cell = |s: &str, i: usize| -> String {
+        // Cells are never truncated — columns grow to their widest cell.
+        let pad = widths[i].saturating_sub(s.chars().count());
+        match t.alignments.get(i).copied().unwrap_or(Alignment::None) {
+            Alignment::Right => format!("{}{s}", " ".repeat(pad)),
+            Alignment::Center => {
+                let l = pad / 2;
+                format!("{}{s}{}", " ".repeat(l), " ".repeat(pad - l))
+            }
+            _ => format!("{s}{}", " ".repeat(pad)),
+        }
+    };
+    let row_line = |cells: &[String], style: Style| -> Line<'static> {
+        let mut spans = vec![Span::styled("│", dim)];
+        for i in 0..ncols {
+            let c = cells.get(i).map(String::as_str).unwrap_or("");
+            spans.push(Span::styled(format!(" {} ", fmt_cell(c, i)), style));
+            spans.push(Span::styled("│", dim));
+        }
+        Line::from(spans)
+    };
+
+    let mut out = vec![border('┌', '┬', '┐')];
+    if !t.header.is_empty() {
+        out.push(row_line(
+            &t.header,
+            Style::default().add_modifier(Modifier::BOLD),
+        ));
+        out.push(border('├', '┼', '┤'));
+    }
+    for r in &t.rows {
+        out.push(row_line(r, Style::default()));
+    }
+    out.push(border('└', '┴', '┘'));
+    out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::render_markdown;
+
+    fn text(lines: &[ratatui::text::Line<'static>]) -> String {
+        lines
+            .iter()
+            .map(|l| {
+                l.spans
+                    .iter()
+                    .map(|s| s.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn renders_gfm_table_as_box_grid() {
+        let md = "| Name | Age |\n|------|----:|\n| Alice | 30 |\n| Bob | 5 |";
+        let out = text(&render_markdown(md));
+        assert!(out.contains('┌') && out.contains('┐'), "top border: {out}");
+        assert!(out.contains('├') && out.contains('┼'), "header sep: {out}");
+        assert!(out.contains("Name") && out.contains("Age"));
+        assert!(out.contains("Alice") && out.contains("Bob"));
+        // Right-aligned Age column keeps the digits flush right.
+        assert!(out.contains("└"));
+    }
+
+    #[test]
+    fn extensions_parse_strikethrough_and_tasklist() {
+        // Without ENABLE_* options these render as raw markup.
+        let strike = text(&render_markdown("~~gone~~"));
+        assert!(strike.contains("gone") && !strike.contains("~~"));
+        let task = text(&render_markdown("- [x] done\n- [ ] todo"));
+        assert!(task.contains("[x]") && task.contains("[ ]"));
+    }
+
+    #[test]
+    fn renders_code_block_as_closed_box() {
+        let out = text(&render_markdown("```rust\nfn x() {}\nlet y = 1;\n```"));
+        assert!(out.contains('┌') && out.contains('┐'), "top corners: {out}");
+        assert!(out.contains('├') && out.contains('┤'), "header separator");
+        assert!(out.contains('└') && out.contains('┘'), "bottom corners");
+        assert!(out.contains("rust"));
+        // Every box row is the same display width (closed, aligned).
+        let widths: Vec<usize> = out
+            .lines()
+            .filter(|l| l.starts_with(['┌', '├', '│', '└']))
+            .map(|l| l.chars().count())
+            .collect();
+        assert!(
+            widths.windows(2).all(|w| w[0] == w[1]),
+            "all box rows equal width: {widths:?}"
+        );
     }
 }

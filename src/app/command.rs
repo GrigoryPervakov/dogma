@@ -56,8 +56,11 @@ pub fn run_command(app: &mut App, line: &str) -> Vec<Action> {
             Vec::new()
         }
         "reload" => {
-            // Refresh sessions list.
-            vec![Action::Http(crate::api::types::HttpReq::ListSessions)]
+            // Rebuild the current chat from scratch (unsticks a hung stream),
+            // then refresh the sessions list.
+            let mut actions = chat_command(app, ChatCommand::Reload);
+            actions.push(Action::Http(crate::api::types::HttpReq::ListSessions));
+            actions
         }
         "new" => chat_command(app, ChatCommand::NewChat(opt_string(rest))),
         "fork" => chat_command(app, ChatCommand::Fork(opt_string(rest))),

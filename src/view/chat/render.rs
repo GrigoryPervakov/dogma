@@ -138,6 +138,11 @@ fn render_title(view: &ChatView, frame: &mut Frame, area: Rect) {
 }
 
 fn render_messages(view: &mut ChatView, frame: &mut Frame, area: Rect, streaming: bool) {
+    // The changed-files browser takes over the whole message area.
+    if matches!(view.focus, FocusTier::Files) {
+        super::files::render(view, frame, area);
+        return;
+    }
     // Blocks render identically in every state; streaming only adds the
     // green whole-chat frame (and removes the input box, handled by caller).
     let area = if streaming {

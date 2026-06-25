@@ -14,7 +14,11 @@ use super::state::{
 };
 
 pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
-    let _ = ctx;
+    // Any event for a session counts as activity — feeds the stall watchdog.
+    if let Some(sid) = msg.session_id() {
+        view.last_activity
+            .insert(sid.to_string(), std::time::Instant::now());
+    }
     match msg {
         WsServerMsg::SessionSwitched { session_id } => {
             // Server told us our active session. If we don't have a current
@@ -30,13 +34,19 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             buffered_events,
             ..
         } => {
-            // Replay buffered events through the same reducer for idempotency.
-            for ev in buffered_events {
-                apply(view, ev, ctx);
-            }
-            if !is_running {
-                view.agent_status
-                    .insert(session_id.clone(), AgentStatus::Idle);
+            if *is_running {
+                // The server resends the whole in-flight turn — rebuild the
+                // streaming buffer from scratch so a reconnect-replay can't
+                // double-append onto a buffer we already had.
+                view.streaming.remove(session_id);
+                for ev in buffered_events {
+                    apply(view, ev, ctx);
+                }
+            } else {
+                // The turn is over. Do NOT replay completed events — that
+                // re-drains a turn already in canonical history (the duplicate
+                // bug). Just heal any orphaned live state.
+                heal_session(view, session_id);
             }
         }
 
@@ -190,6 +200,11 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             if let Some(s) = view.sessions.iter_mut().find(|s| &s.id == session_id) {
                 s.is_running = *is_running;
             }
+            // Belt-and-suspenders: the server says the run ended but we may be
+            // stuck streaming (a lost Done) — drain the orphaned buffer.
+            if !is_running {
+                heal_session(view, session_id);
+            }
         }
 
         WsServerMsg::Interaction {
@@ -212,12 +227,10 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
                         tool_input: tool_input.clone(),
                     },
                 );
-                // Build the poll selection state and, for a question waiting on
-                // the session we're viewing, jump straight to answering it.
+                // Build the poll selection state and, for an interaction
+                // waiting on the session we're viewing, jump straight to it.
                 view.sync_poll();
-                if view.active_poll().is_some() {
-                    view.focus = FocusTier::Poll;
-                }
+                view.focus_interaction_if_pending();
             }
         }
 
@@ -257,8 +270,8 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
         }
 
         WsServerMsg::PlanUpdate { .. } => {
-            // For v1, treat plan content as a normal text update —
-            // future: dedicated plan panel + ExitPlanMode flow.
+            // The plan is carried on the ExitPlanMode tool block (rendered in
+            // the stream), so the streamed preview is a no-op here.
         }
 
         WsServerMsg::AnswerInjected {
@@ -277,10 +290,14 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
                 .insert(session_id.clone(), tasks.clone());
         }
 
+        WsServerMsg::FileChanged { session_id, .. } => {
+            // Keep the changed-files list fresh if we're already tracking it.
+            view.refresh_modified_files(session_id, ctx);
+        }
+
         WsServerMsg::SessionResumed { .. }
         | WsServerMsg::SessionForked { .. }
         | WsServerMsg::SessionArchived { .. }
-        | WsServerMsg::FileChanged { .. }
         | WsServerMsg::HoaProgress { .. }
         | WsServerMsg::Notification(_)
         | WsServerMsg::NotificationAnswered(_)
@@ -294,7 +311,10 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
 }
 
 fn update_follow_tail_selection(view: &mut ChatView) {
-    if !matches!(view.focus, FocusTier::ChatBlocks) {
+    // Re-pin to the tail wherever the live message list is on screen — that
+    // includes the sidebar (Sessions) and while typing (Input/Insert), not
+    // just ChatBlocks. Skip the tiers that replace the message area.
+    if matches!(view.focus, FocusTier::BlockInterior | FocusTier::Files) {
         return;
     }
     let total = super::items::count(view.current_history(), view.current_streaming());
@@ -307,6 +327,26 @@ fn update_follow_tail_selection(view: &mut ChatView) {
         ui.selected_block = Some(total - 1);
         ui.seen_block_count = total;
     }
+}
+
+/// Drain an orphaned in-flight buffer into history and mark the session idle.
+/// Used when a run ended (server broadcast, stall, reconnect) but no
+/// Done/Stopped/Error reached us — otherwise the chat stays stuck "streaming".
+pub(super) fn heal_session(view: &mut ChatView, session_id: &str) {
+    if let Some(streaming) = view.streaming.remove(session_id)
+        && !streaming.blocks.is_empty()
+    {
+        view.history
+            .entry(session_id.to_string())
+            .or_default()
+            .push(streaming);
+    }
+    view.agent_status
+        .insert(session_id.to_string(), AgentStatus::Idle);
+    if let Some(s) = view.sessions.iter_mut().find(|s| s.id == session_id) {
+        s.is_running = false;
+    }
+    view.last_activity.remove(session_id);
 }
 
 fn stream_msg_mut<'a>(view: &'a mut ChatView, session_id: &str) -> &'a mut Message {
@@ -1060,5 +1100,137 @@ mod tests {
             }
             _ => panic!("expected matching tool_call blocks"),
         }
+    }
+
+    /// Follow-tail re-pins the selection to the newest block even when the
+    /// sidebar (Sessions tier) is focused — autoscroll on the session screen.
+    #[test]
+    fn follow_tail_repins_selection_in_sessions_tier() {
+        let mut v = fresh_chat("s1");
+        v.focus = crate::view::chat::FocusTier::Sessions;
+        v.ui.entry(SessionKey::Real("s1".into()))
+            .or_default()
+            .follow_tail = true;
+        let mut a = Vec::new();
+        let mut ctx = fake_ctx(&mut a);
+        // Three text tokens land as one streaming text block; a tool call adds
+        // a second block — selection must track the last item.
+        apply(
+            &mut v,
+            &WsServerMsg::Token {
+                session_id: "s1".into(),
+                content: "hi".into(),
+                parent_tool_use_id: None,
+            },
+            &mut ctx,
+        );
+        apply(
+            &mut v,
+            &WsServerMsg::ToolUse {
+                session_id: "s1".into(),
+                tool: "Bash".into(),
+                input: serde_json::json!({}),
+                tool_use_id: Some("t1".into()),
+                parent_tool_use_id: None,
+            },
+            &mut ctx,
+        );
+        let ui = &v.ui[&SessionKey::Real("s1".into())];
+        assert_eq!(ui.selected_block, Some(1), "selection pinned to last block");
+    }
+
+    fn token(content: &str) -> WsServerMsg {
+        WsServerMsg::Token {
+            session_id: "s".into(),
+            content: content.into(),
+            parent_tool_use_id: None,
+        }
+    }
+
+    fn done() -> WsServerMsg {
+        WsServerMsg::Done {
+            session_id: "s".into(),
+            usage: None,
+            max_context_tokens: None,
+            num_turns: None,
+        }
+    }
+
+    /// A finished session's buffered events must not re-drain an already-stored
+    /// turn into history — the duplicate-messages bug.
+    #[test]
+    fn buffered_replay_when_not_running_does_not_duplicate_history() {
+        let mut v = fresh_chat("s");
+        run_events(&mut v, &[token("hello"), done()]);
+        assert_eq!(v.history.get("s").map(|h| h.len()), Some(1));
+
+        let mut a = Vec::new();
+        let mut ctx = fake_ctx(&mut a);
+        apply(
+            &mut v,
+            &WsServerMsg::SessionStatus {
+                session_id: "s".into(),
+                is_running: false,
+                status: None,
+                buffered_events: vec![token("hello"), done()],
+            },
+            &mut ctx,
+        );
+        assert_eq!(
+            v.history.get("s").map(|h| h.len()),
+            Some(1),
+            "completed turn must not be re-added"
+        );
+    }
+
+    /// A running session's SessionStatus rebuilds the buffer from scratch
+    /// rather than appending onto the existing one (no doubled text).
+    #[test]
+    fn running_session_status_rebuilds_buffer_without_doubling() {
+        let mut v = fresh_chat("s");
+        run_events(&mut v, &[token("hello")]);
+        let mut a = Vec::new();
+        let mut ctx = fake_ctx(&mut a);
+        apply(
+            &mut v,
+            &WsServerMsg::SessionStatus {
+                session_id: "s".into(),
+                is_running: true,
+                status: None,
+                buffered_events: vec![token("hello world")],
+            },
+            &mut ctx,
+        );
+        match &v.streaming.get("s").unwrap().blocks[0] {
+            Block::Text { content } => assert_eq!(content, "hello world"),
+            other => panic!("unexpected block: {other:?}"),
+        }
+    }
+
+    /// `session_running: false` heals an orphaned stream (lost Done) by
+    /// draining the buffer and going idle.
+    #[test]
+    fn session_running_false_heals_orphaned_stream() {
+        let mut v = fresh_chat("s");
+        v.sessions = vec![
+            serde_json::from_value(serde_json::json!({ "id": "s", "is_running": true })).unwrap(),
+        ];
+        run_events(&mut v, &[token("partial")]);
+        assert!(v.streaming.contains_key("s"));
+
+        let mut a = Vec::new();
+        let mut ctx = fake_ctx(&mut a);
+        apply(
+            &mut v,
+            &WsServerMsg::SessionRunning {
+                session_id: "s".into(),
+                is_running: false,
+            },
+            &mut ctx,
+        );
+        assert!(!v.streaming.contains_key("s"), "orphaned buffer drained");
+        assert!(matches!(v.agent_status.get("s"), Some(AgentStatus::Idle)));
+        assert_eq!(v.history.get("s").map(|h| h.len()), Some(1));
+        assert!(!v.sessions[0].is_running);
     }
 }

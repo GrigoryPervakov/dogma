@@ -180,6 +180,9 @@ fn session_line(
         SessionRuntime::WaitingPoll => {
             spans.push(Span::styled("?".to_string(), theme::session_waiting()));
         }
+        SessionRuntime::WaitingPlan => {
+            spans.push(Span::styled("◆".to_string(), theme::session_waiting_plan()));
+        }
         SessionRuntime::Idle if s.starred => {
             spans.push(Span::styled(
                 "★".to_string(),
@@ -199,6 +202,7 @@ fn session_line(
         match runtime {
             SessionRuntime::Streaming => theme::session_streaming(),
             SessionRuntime::WaitingPoll => theme::session_waiting(),
+            SessionRuntime::WaitingPlan => theme::session_waiting_plan(),
             SessionRuntime::Idle if is_system_session(s) => {
                 Style::default().fg(Color::LightMagenta)
             }
