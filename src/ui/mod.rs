@@ -45,13 +45,11 @@ pub fn render(app: &mut App, frame: &mut Frame) {
 fn render_body(app: &mut App, frame: &mut Frame, area: Rect) {
     let mode = app.mode;
     let cmd_buf = app.command_buffer.clone();
-    let ws = app.ws.clone();
-    let server = app.auth.server.clone();
+    let instances = app.instances.clone();
     let ctx = ViewRenderCtx {
         mode,
         command_buffer: &cmd_buf,
-        ws: &ws,
-        server: &server,
+        instances: &instances,
     };
     let idx = app.current_view;
     app.views[idx].render(area, frame, ctx);
@@ -81,6 +79,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         row("  actions  :new  :fork  :resume  :rename  :delete  :reload  :q"),
         head("CHAT"),
         row("  Sessions  ↑↓/jk walk · Enter/→ open · / search"),
+        row("            multi-instance: rows tagged ‹sigil name›; Enter on"),
+        row("            + new chat asks which instance it lands on"),
         row("  Messages  ↑↓/jk walk · g/G top/bot · PgUp/Dn · Enter expand"),
         row("            i input · Ctrl+B sidebar · Ctrl+P panel · Ctrl+F files"),
         row("  Block     ↑↓/jk scroll · g/G top/bot · PgUp/Dn · Esc/← back"),
@@ -92,9 +92,11 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         row("            or block view; navigate freely without answering)"),
         row("  Files     ↑↓ list · Enter diff · ↑↓ scroll · r refresh · Esc back"),
         head("NOTIFS"),
-        row("  ↑↓/jk move · 1-9 answer poll · d dismiss · r refresh · Enter detail"),
+        row("  ↑↓/jk move · 1-9 answer poll · d dismiss · a all · r refresh"),
+        row("  (pending only by default; a toggles answered/dismissed)"),
         head("TASKS · PLANS · SKILLS"),
-        row("  ↑↓/jk move · Enter/→ detail · r refresh"),
+        row("  ↑↓/jk move · Enter/→ detail · a all · r refresh"),
+        row("  (lists are time-sorted; a shows done/declined items)"),
         Line::from(""),
         Line::from(Span::styled(
             "press any key to close",

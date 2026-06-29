@@ -29,6 +29,10 @@ pub struct Session {
     pub message_count: u32,
     #[serde(default)]
     pub total_cost_usd: f64,
+    /// Which Nerve instance this session came from. Stamped at ingest, never
+    /// on the wire.
+    #[serde(default, skip)]
+    pub instance: crate::instance::InstanceId,
 }
 
 fn de_flex_bool<'de, D>(d: D) -> Result<bool, D::Error>

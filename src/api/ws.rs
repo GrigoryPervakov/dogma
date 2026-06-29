@@ -137,31 +137,45 @@ async fn run(
                     || reason.contains("4001")
                     || reason.to_lowercase().contains("unauthorized");
                 if auth_rejected {
-                    // Token likely expired — try to reissue it from the stored
-                    // password and reconnect, rather than giving up.
                     if auth.can_reauth() {
+                        // Token likely expired — try to reissue it from the
+                        // stored password and reconnect. If the reissue itself
+                        // fails (server restarting / briefly down), treat it as
+                        // a normal disconnect and keep retrying with backoff
+                        // rather than giving up permanently.
                         match auth.reauth().await {
                             Ok(_) => {
                                 info!("ws: token reissued after auth rejection; reconnecting");
                                 backoff_ms = 1_000;
                                 continue;
                             }
-                            Err(re) => error!(%re, "ws: re-auth failed"),
+                            Err(re) => {
+                                warn!(%re, "ws: re-auth failed; will retry");
+                                let _ = events_tx
+                                    .send(WireOut::Conn(WsConnEvent::Disconnected {
+                                        reason,
+                                        retry_in_ms: Some(backoff_ms),
+                                    }))
+                                    .await;
+                            }
                         }
+                    } else {
+                        // No password to recover with — stop.
+                        error!(%reason, "ws: auth rejected");
+                        let _ = events_tx
+                            .send(WireOut::Conn(WsConnEvent::AuthRejected))
+                            .await;
+                        return;
                     }
-                    error!(%reason, "ws: auth rejected");
+                } else {
+                    warn!(%reason, "ws: connect failed");
                     let _ = events_tx
-                        .send(WireOut::Conn(WsConnEvent::AuthRejected))
+                        .send(WireOut::Conn(WsConnEvent::Disconnected {
+                            reason,
+                            retry_in_ms: Some(backoff_ms),
+                        }))
                         .await;
-                    return;
                 }
-                warn!(%reason, "ws: connect failed");
-                let _ = events_tx
-                    .send(WireOut::Conn(WsConnEvent::Disconnected {
-                        reason,
-                        retry_in_ms: Some(backoff_ms),
-                    }))
-                    .await;
             }
         }
 

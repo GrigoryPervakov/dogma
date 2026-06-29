@@ -1,21 +1,21 @@
 ---
 source: tests/render.rs
-assertion_line: 349
+assertion_line: 384
 expression: "render_buf(&mut app, 80, 16)"
 ---
 dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory 
-Sessions  · / search        # + new chat                                        
-────────────────────────────                                                    
-▶ + new chat               │                                                    
-    (no sessions yet)      │no messages yet — type below and press Enter to star
-                           │                                                    
-                           │                                                    
-                           │                                                    
-                           │                                                    
-                           │                                                    
-                           │                                                    
-                           │                                                    
-                           │┌ input · ↓ or i to focus ─────────────────────────┐
-                           ││                                                  │
-                           │└──────────────────────────────────────────────────┘
+Sessions  · / search          # + new chat                                      
+──────────────────────────────                                                  
+▶ + new chat                 │                                                  
+    (no sessions yet)        │no messages yet — type below and press Enter to st
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │┌ input · ↓ or i to focus ───────────────────────┐
+                             ││                                                │
+                             │└────────────────────────────────────────────────┘
 NORMAL · sessions │ idle │ session: + new chat │ ○ ws offline │ ctx — Enter open

@@ -11,7 +11,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::api::types::HttpReq;
-use crate::app::action::Action;
+use crate::instance::InstanceId;
 use crate::model::Notification;
 use crate::view::list_detail::{
     ListDetailRender, NavOutcome, Pane, handle_nav, meta_line, truncate,
@@ -25,6 +25,8 @@ pub struct NotificationsView {
     loaded: bool,
     loading: bool,
     last_error: Option<String>,
+    /// When false (default), only pending notifications are shown; `a` toggles.
+    show_all: bool,
 }
 
 impl NotificationsView {
@@ -36,11 +38,25 @@ impl NotificationsView {
             loaded: false,
             loading: false,
             last_error: None,
+            show_all: false,
         }
     }
 
+    /// The notifications currently on screen — pending-only unless `show_all`.
+    fn shown(&self) -> Vec<&Notification> {
+        self.items
+            .iter()
+            .filter(|n| self.show_all || n.is_pending())
+            .collect()
+    }
+
+    fn clamp_selection(&mut self) {
+        let n = self.shown().len();
+        self.selected = self.selected.min(n.saturating_sub(1));
+    }
+
     fn current(&self) -> Option<&Notification> {
-        self.items.get(self.selected)
+        self.shown().get(self.selected).copied()
     }
 
     /// Any unanswered/undismissed notification — drives the red nav-rail tab.
@@ -48,14 +64,29 @@ impl NotificationsView {
         self.items.iter().any(|n| n.is_pending())
     }
 
-    pub fn apply_list_loaded(&mut self, r: std::result::Result<Vec<Notification>, String>) {
+    pub fn apply_list_loaded(
+        &mut self,
+        instance: InstanceId,
+        r: std::result::Result<Vec<Notification>, String>,
+    ) {
         self.loading = false;
         match r {
-            Ok(list) => {
-                self.items = list;
+            Ok(mut list) => {
+                for n in &mut list {
+                    n.instance = instance;
+                }
+                self.items.retain(|n| n.instance != instance);
+                self.items.append(&mut list);
+                // Newest first across instances, not grouped by instance.
+                self.items.sort_by(|a, b| {
+                    b.created_at
+                        .as_deref()
+                        .unwrap_or("")
+                        .cmp(a.created_at.as_deref().unwrap_or(""))
+                });
                 self.loaded = true;
                 self.last_error = None;
-                self.selected = self.selected.min(self.items.len().saturating_sub(1));
+                self.clamp_selection();
             }
             Err(e) => self.last_error = Some(e),
         }
@@ -63,13 +94,18 @@ impl NotificationsView {
 
     pub fn apply_answered(
         &mut self,
+        instance: InstanceId,
         id: &str,
         answer: &str,
         result: std::result::Result<(), String>,
     ) {
         match result {
             Ok(()) => {
-                if let Some(n) = self.items.iter_mut().find(|n| n.id == id) {
+                if let Some(n) = self
+                    .items
+                    .iter_mut()
+                    .find(|n| n.instance == instance && n.id == id)
+                {
                     n.status = "answered".into();
                     n.answer = Some(answer.to_string());
                 }
@@ -78,10 +114,19 @@ impl NotificationsView {
         }
     }
 
-    pub fn apply_dismissed(&mut self, id: &str, result: std::result::Result<(), String>) {
+    pub fn apply_dismissed(
+        &mut self,
+        instance: InstanceId,
+        id: &str,
+        result: std::result::Result<(), String>,
+    ) {
         match result {
             Ok(()) => {
-                if let Some(n) = self.items.iter_mut().find(|n| n.id == id) {
+                if let Some(n) = self
+                    .items
+                    .iter_mut()
+                    .find(|n| n.instance == instance && n.id == id)
+                {
                     n.status = "dismissed".into();
                 }
             }
@@ -91,46 +136,61 @@ impl NotificationsView {
 
     fn refresh(&mut self, ctx: &mut ViewCtx) {
         self.loading = true;
-        ctx.push(Action::Http(HttpReq::ListNotifications));
+        ctx.http_all(HttpReq::ListNotifications);
     }
 
     /// Answer the highlighted pending poll with option `opt_idx`.
     fn answer_selected(&mut self, opt_idx: usize, ctx: &mut ViewCtx) {
-        let Some(n) = self.items.get(self.selected) else {
-            return;
+        let (id, instance, answer) = {
+            let Some(n) = self.shown().get(self.selected).copied() else {
+                return;
+            };
+            if !n.answerable() {
+                return;
+            }
+            let Some(answer) = n.options.get(opt_idx).cloned() else {
+                return;
+            };
+            (n.id.clone(), n.instance, answer)
         };
-        if !n.answerable() {
-            return;
-        }
-        let Some(answer) = n.options.get(opt_idx).cloned() else {
-            return;
-        };
-        let id = n.id.clone();
-        ctx.push(Action::Http(HttpReq::AnswerNotification {
-            id: id.clone(),
-            answer: answer.clone(),
-        }));
+        ctx.http(
+            instance,
+            HttpReq::AnswerNotification {
+                id: id.clone(),
+                answer: answer.clone(),
+            },
+        );
         // Optimistic — confirmed by the result handler, reverted on error.
-        if let Some(n) = self.items.iter_mut().find(|x| x.id == id) {
+        if let Some(n) = self
+            .items
+            .iter_mut()
+            .find(|x| x.instance == instance && x.id == id)
+        {
             n.status = "answered".into();
             n.answer = Some(answer);
         }
+        self.clamp_selection();
     }
 
     fn dismiss_selected(&mut self, ctx: &mut ViewCtx) {
-        let Some(n) = self.items.get(self.selected) else {
-            return;
+        let (id, instance) = {
+            let Some(n) = self.shown().get(self.selected).copied() else {
+                return;
+            };
+            if !n.is_pending() {
+                return;
+            }
+            (n.id.clone(), n.instance)
         };
-        if !n.is_pending() {
-            return;
-        }
-        let id = n.id.clone();
-        ctx.push(Action::Http(HttpReq::DismissNotification {
-            id: id.clone(),
-        }));
-        if let Some(n) = self.items.iter_mut().find(|x| x.id == id) {
+        ctx.http(instance, HttpReq::DismissNotification { id: id.clone() });
+        if let Some(n) = self
+            .items
+            .iter_mut()
+            .find(|x| x.instance == instance && x.id == id)
+        {
             n.status = "dismissed".into();
         }
+        self.clamp_selection();
     }
 }
 
@@ -156,12 +216,10 @@ impl View for NotificationsView {
 
     fn handle_key(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
         // Shared list nav first; notification-specific keys fall through.
-        if let NavOutcome::Moved | NavOutcome::Switched = handle_nav(
-            key.code,
-            &mut self.focused_pane,
-            &mut self.selected,
-            self.items.len(),
-        ) {
+        let len = self.shown().len();
+        if let NavOutcome::Moved | NavOutcome::Switched =
+            handle_nav(key.code, &mut self.focused_pane, &mut self.selected, len)
+        {
             return;
         }
         match key.code {
@@ -169,6 +227,11 @@ impl View for NotificationsView {
                 self.answer_selected((c as usize) - ('1' as usize), ctx);
             }
             KeyCode::Char('d') => self.dismiss_selected(ctx),
+            // Toggle showing answered/dismissed notifications.
+            KeyCode::Char('a') => {
+                self.show_all = !self.show_all;
+                self.clamp_selection();
+            }
             KeyCode::Char('r') => {
                 self.last_error = None;
                 self.refresh(ctx);
@@ -177,8 +240,30 @@ impl View for NotificationsView {
         }
     }
 
-    fn render(&mut self, area: Rect, frame: &mut Frame, _ctx: ViewRenderCtx<'_>) {
-        let items: Vec<Line<'_>> = self.items.iter().map(notif_list_line).collect();
+    fn render(&mut self, area: Rect, frame: &mut Frame, ctx: ViewRenderCtx<'_>) {
+        let multi = ctx.multi_instance();
+        let shown = self.shown();
+        let hidden = self.items.len() - shown.len();
+        let items: Vec<Line<'_>> = shown
+            .iter()
+            .map(|n| {
+                let mut line = notif_list_line(n);
+                if multi {
+                    let label = ctx
+                        .instance(n.instance)
+                        .map(|m| m.label.as_str())
+                        .unwrap_or("");
+                    line.spans.insert(
+                        0,
+                        Span::styled(
+                            format!("{} {label} ", crate::ui::theme::instance_sigil(n.instance)),
+                            Style::default().fg(crate::ui::theme::instance_color(n.instance)),
+                        ),
+                    );
+                }
+                line
+            })
+            .collect();
         let n = self.current();
         let detail_title = n
             .and_then(|n| n.title.as_deref())
@@ -200,6 +285,8 @@ impl View for NotificationsView {
                 detail_meta,
                 detail_body,
                 detail_loading: false,
+                showing_all: self.show_all,
+                hidden,
             },
         );
     }
@@ -291,7 +378,11 @@ fn notif_meta(n: &Notification) -> Vec<Line<'static>> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::app::action::Action;
+    use crate::instance::InstanceId;
     use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
+
+    const TEST_IDS: [InstanceId; 1] = [InstanceId::PRIMARY];
 
     fn poll(id: &str) -> Notification {
         serde_json::from_value(serde_json::json!({
@@ -309,16 +400,17 @@ mod tests {
     #[test]
     fn number_key_answers_selected_poll() {
         let mut v = NotificationsView::new();
-        v.apply_list_loaded(Ok(vec![poll("ask-1")]));
+        v.apply_list_loaded(InstanceId::PRIMARY, Ok(vec![poll("ask-1")]));
         let mut acts = Vec::new();
         let mut ctx = ViewCtx {
             app_actions: &mut acts,
+            instances: &TEST_IDS,
         };
         v.handle_key(key('2'), &mut ctx);
 
         let answered = acts.iter().any(|a| matches!(
             a,
-            Action::Http(HttpReq::AnswerNotification { id, answer }) if id == "ask-1" && answer == "Green"
+            Action::Http { req: HttpReq::AnswerNotification { id, answer }, .. } if id == "ask-1" && answer == "Green"
         ));
         assert!(answered, "expected answer with Green, got {acts:?}");
         assert_eq!(v.items[0].status, "answered");
@@ -328,16 +420,17 @@ mod tests {
     #[test]
     fn dismiss_key_dismisses_pending() {
         let mut v = NotificationsView::new();
-        v.apply_list_loaded(Ok(vec![poll("ask-1")]));
+        v.apply_list_loaded(InstanceId::PRIMARY, Ok(vec![poll("ask-1")]));
         let mut acts = Vec::new();
         let mut ctx = ViewCtx {
             app_actions: &mut acts,
+            instances: &TEST_IDS,
         };
         v.handle_key(key('d'), &mut ctx);
 
         assert!(acts.iter().any(|a| matches!(
             a,
-            Action::Http(HttpReq::DismissNotification { id }) if id == "ask-1"
+            Action::Http { req: HttpReq::DismissNotification { id }, .. } if id == "ask-1"
         )));
         assert_eq!(v.items[0].status, "dismissed");
     }
@@ -349,10 +442,11 @@ mod tests {
             "id": "x", "type": "notify", "status": "pending", "options": null
         }))
         .unwrap();
-        v.apply_list_loaded(Ok(vec![n]));
+        v.apply_list_loaded(InstanceId::PRIMARY, Ok(vec![n]));
         let mut acts = Vec::new();
         let mut ctx = ViewCtx {
             app_actions: &mut acts,
+            instances: &TEST_IDS,
         };
         v.handle_key(key('1'), &mut ctx);
         assert!(

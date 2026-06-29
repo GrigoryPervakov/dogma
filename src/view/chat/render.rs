@@ -9,20 +9,26 @@ use ratatui::widgets::{Block as RatBlock, Borders, Paragraph, Wrap};
 use super::blocks::{BlockSelection, render_item};
 use super::items;
 use super::state::{ChatView, FocusTier, SessionKey};
+use crate::app::state::InstanceMeta;
+use crate::ui::theme;
 use crate::view::ViewRenderCtx;
 
-pub fn render(view: &mut ChatView, area: Rect, frame: &mut Frame, _ctx: &ViewRenderCtx<'_>) {
+pub fn render(view: &mut ChatView, area: Rect, frame: &mut Frame, ctx: &ViewRenderCtx<'_>) {
     let show_sidebar = view.sidebar_visible && area.width >= 80;
     let show_panel =
         view.side_panel.visible && !view.side_panel.panels.is_empty() && area.width >= 100;
 
+    // Responsive sidebar: ~28% of the width, clamped so titles (plus the
+    // instance badge) fit on wide terminals without starving the chat on
+    // narrow ones.
+    let sidebar_w = (area.width * 28 / 100).clamp(30, 44);
     let constraints: Vec<Constraint> = match (show_sidebar, show_panel) {
         (true, true) => vec![
-            Constraint::Length(28),
+            Constraint::Length(sidebar_w),
             Constraint::Min(40),
             Constraint::Length(36),
         ],
-        (true, false) => vec![Constraint::Length(28), Constraint::Min(40)],
+        (true, false) => vec![Constraint::Length(sidebar_w), Constraint::Min(40)],
         (false, true) => vec![Constraint::Min(40), Constraint::Length(36)],
         (false, false) => vec![Constraint::Min(40)],
     };
@@ -30,12 +36,12 @@ pub fn render(view: &mut ChatView, area: Rect, frame: &mut Frame, _ctx: &ViewRen
 
     let mut col_idx = 0;
     if show_sidebar {
-        super::sidebar::render(view, frame, cols[col_idx]);
+        super::sidebar::render(view, frame, cols[col_idx], ctx.instances);
         col_idx += 1;
     }
     let main = cols[col_idx];
     col_idx += 1;
-    render_main(view, frame, main);
+    render_main(view, frame, main, ctx.instances);
 
     if show_panel {
         let panel_area = cols[col_idx];
@@ -47,7 +53,7 @@ pub fn render(view: &mut ChatView, area: Rect, frame: &mut Frame, _ctx: &ViewRen
 // Main column: title bar + message list + input
 // ---------------------------------------------------------------------------
 
-fn render_main(view: &mut ChatView, frame: &mut Frame, area: Rect) {
+fn render_main(view: &mut ChatView, frame: &mut Frame, area: Rect, instances: &[InstanceMeta]) {
     // Owned line buffers — computed up front so the immutable borrows release
     // before the &mut renders below.
     let poll_lines = view.active_poll().map(super::poll::render_lines);
@@ -59,12 +65,18 @@ fn render_main(view: &mut ChatView, frame: &mut Frame, area: Rect) {
     // While the active session streams, the input box is removed and the
     // whole chat gets a green frame instead.
     let streaming = view.is_current_streaming();
+    // The new-chat instance picker takes over the input slot.
+    let picker_lines = matches!(view.focus, FocusTier::NewChatPicker)
+        .then(|| new_chat_picker_lines(view, instances));
     let input_height = compute_input_height(view, area.width);
 
     let task_height = task_lines
         .as_ref()
         .map(|l| ((l.len() as u16) + 2).clamp(3, (area.height / 3).max(3)));
     let poll_height = poll_lines
+        .as_ref()
+        .map(|l| ((l.len() as u16) + 2).clamp(3, (area.height / 2).max(3)));
+    let picker_height = picker_lines
         .as_ref()
         .map(|l| ((l.len() as u16) + 2).clamp(3, (area.height / 2).max(3)));
 
@@ -75,7 +87,9 @@ fn render_main(view: &mut ChatView, frame: &mut Frame, area: Rect) {
     if let Some(h) = poll_height {
         constraints.push(Constraint::Length(h));
     }
-    if !streaming {
+    if let Some(h) = picker_height {
+        constraints.push(Constraint::Length(h));
+    } else if !streaming {
         constraints.push(Constraint::Length(input_height));
     }
     let layout = Layout::vertical(constraints).split(area);
@@ -91,9 +105,42 @@ fn render_main(view: &mut ChatView, frame: &mut Frame, area: Rect) {
         render_poll_card(frame, layout[idx], lines);
         idx += 1;
     }
-    if !streaming {
+    if let (Some(lines), Some(_)) = (picker_lines, picker_height) {
+        render_side_block(frame, layout[idx], lines, " new chat ");
+    } else if !streaming {
         render_input(view, frame, layout[idx]);
     }
+}
+
+/// Lines for the new-chat instance picker card.
+fn new_chat_picker_lines(view: &ChatView, instances: &[InstanceMeta]) -> Vec<Line<'static>> {
+    let mut out = vec![
+        Line::from(Span::styled(
+            "Start new chat on:",
+            Style::default().add_modifier(Modifier::BOLD),
+        )),
+        Line::raw(""),
+    ];
+    for (i, m) in instances.iter().enumerate() {
+        let on = i == view.new_chat_pick;
+        let color = theme::instance_color(m.id);
+        let prefix = if on { "▸ " } else { "  " };
+        let style = if on {
+            Style::default().fg(Color::Black).bg(color)
+        } else {
+            Style::default().fg(color)
+        };
+        out.push(Line::from(Span::styled(
+            format!("{prefix}{} {}", theme::instance_sigil(m.id), m.label),
+            style,
+        )));
+    }
+    out.push(Line::raw(""));
+    out.push(Line::from(Span::styled(
+        "↑↓ pick · Enter ok · Esc cancel",
+        Style::default().add_modifier(Modifier::DIM),
+    )));
+    out
 }
 
 fn render_poll_card(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
@@ -122,12 +169,12 @@ fn render_side_block(frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>, t
 
 fn render_title(view: &ChatView, frame: &mut Frame, area: Rect) {
     let title = match &view.current {
-        SessionKey::Real(id) => view
+        SessionKey::Real(sref) => view
             .sessions
             .iter()
-            .find(|s| &s.id == id)
+            .find(|s| s.instance == sref.instance && s.id == sref.id)
             .and_then(|s| s.title.clone())
-            .unwrap_or_else(|| id.to_string()),
+            .unwrap_or_else(|| sref.id.clone()),
         SessionKey::NewChat => "+ new chat".to_string(),
     };
     let line = Line::from(vec![
@@ -201,8 +248,8 @@ fn render_messages(view: &mut ChatView, frame: &mut Frame, area: Rect, streaming
 
     let show_load_more_hint = top == 0
         && view
-            .current_session_id()
-            .map(|id| view.can_load_more(id))
+            .current_session_ref()
+            .map(|r| view.can_load_more(r))
             .unwrap_or(false);
     let hint_height: u16 = if show_load_more_hint || view.is_loading_history() {
         1

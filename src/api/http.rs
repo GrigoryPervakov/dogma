@@ -81,7 +81,10 @@ struct LoginResp {
 
 #[derive(Debug, Deserialize)]
 struct MessagesResp {
-    messages: Vec<Message>,
+    // Decoded per-element so one malformed message/block can't fail the whole
+    // history (e.g. a different-version instance's schema quirk).
+    #[serde(default)]
+    messages: Vec<serde_json::Value>,
     #[serde(default)]
     last_usage: Option<Usage>,
 }
@@ -250,9 +253,25 @@ impl HttpClient {
             .await
             .context("GET /api/sessions/{id}/messages")?;
         ensure_ok(&resp, "get messages")?;
-        let body: MessagesResp = resp.json().await.context("parse messages response")?;
+        // Read the body once so a decode failure can surface what actually came
+        // back (a 200 with an unexpected shape — e.g. a different Nerve version)
+        // rather than an opaque "error decoding response body".
+        let bytes = resp.bytes().await.context("read messages body")?;
+        let body: MessagesResp = serde_json::from_slice(&bytes).map_err(|e| {
+            let snippet: String = String::from_utf8_lossy(&bytes).chars().take(300).collect();
+            anyhow::anyhow!("parse messages envelope: {e}; body starts: {snippet}")
+        })?;
+        // Decode each message on its own; skip (and log) any that don't fit the
+        // model so a single bad row/block can't blank the whole conversation.
+        let mut messages = Vec::with_capacity(body.messages.len());
+        for raw in body.messages {
+            match serde_json::from_value::<Message>(raw.clone()) {
+                Ok(m) => messages.push(m.hydrate()),
+                Err(e) => tracing::warn!(error = %e, raw = %raw, "skipping unparseable message"),
+            }
+        }
         Ok(MessagesPayload {
-            messages: body.messages.into_iter().map(Message::hydrate).collect(),
+            messages,
             last_usage: body.last_usage,
         })
     }

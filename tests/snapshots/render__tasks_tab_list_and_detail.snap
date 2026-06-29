@@ -1,14 +1,14 @@
 ---
 source: tests/render.rs
-assertion_line: 408
+assertion_line: 451
 expression: "render_buf(&mut app, 100, 24)"
 ---
 dogma   chat    notifs   [tasks]   plans    skills    cron    sources    memory    diag             
-Tasks (3)                           # Fix flaky webhook test                                        
+Tasks (2) · +1 hidden · a           # Fix flaky webhook test                                        
 ────────────────────────────────────                                                                
 ▶ ❯ Fix flaky webhook test         │status     in_progress                                          
   • Review PR #175                 │deadline   2026-05-02 12:00                                     
-  ✓ Rebase main                    │source     github                                               
+                                   │source     github                                               
                                    │url        https://github.com/x/y/issues/42                     
                                    │created    2026-04-25 10:00:00                                  
                                    │                                                                
@@ -26,4 +26,4 @@ Tasks (3)                           # Fix flaky webhook test
                                    │• [ ] Add retry on transient errors                             
                                    │                                                                
                                    │                                                                
-NORMAL · tasks │ ○ ws offline                  ↑↓/jk move · Enter open · r refresh · Tab switch tab
+NORMAL · tasks │ ○ ws offline                           ↑↓/jk move · Enter open · a all · r refresh

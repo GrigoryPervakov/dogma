@@ -1,18 +1,20 @@
 ---
 source: tests/render.rs
-assertion_line: 341
+assertion_line: 378
 expression: "render_buf(&mut app, 100, 30)"
 ---
 dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory    diag             
 Sessions  · ┌ help ────────────────────────────────────────────────────────────────────┐            
 ────────────│GLOBAL                                                                    │            
 ▶ + new chat│  Tab / S-Tab  cycle tabs    :  command    ?  help    q  quit             │            
-    (no sess│  Ctrl+C  stop the running agent (or quit)                                │art         
+    (no sess│  Ctrl+C  stop the running agent (or quit)                                │tart        
             │COMMANDS   (Tab autocompletes; singular or plural)                        │            
             │  tabs     :chat  :notifs  :tasks  :plans  :skills                        │            
             │  actions  :new  :fork  :resume  :rename  :delete  :reload  :q            │            
             │CHAT                                                                      │            
             │  Sessions  ↑↓/jk walk · Enter/→ open · / search                          │            
+            │            multi-instance: rows tagged ‹sigil name›; Enter on            │            
+            │            + new chat asks which instance it lands on                    │            
             │  Messages  ↑↓/jk walk · g/G top/bot · PgUp/Dn · Enter expand             │            
             │            i input · Ctrl+B sidebar · Ctrl+P panel · Ctrl+F files        │            
             │  Block     ↑↓/jk scroll · g/G top/bot · PgUp/Dn · Esc/← back             │            
@@ -24,12 +26,10 @@ Sessions  · ┌ help ───────────────────�
             │            or block view; navigate freely without answering)             │            
             │  Files     ↑↓ list · Enter diff · ↑↓ scroll · r refresh · Esc back       │            
             │NOTIFS                                                                    │            
-            │  ↑↓/jk move · 1-9 answer poll · d dismiss · r refresh · Enter detail     │            
+            │  ↑↓/jk move · 1-9 answer poll · d dismiss · a all · r refresh            │            
+            │  (pending only by default; a toggles answered/dismissed)                 │            
             │TASKS · PLANS · SKILLS                                                    │            
-            │  ↑↓/jk move · Enter/→ detail · r refresh                                 │            
-            │                                                                          │            
-            │press any key to close                                                    │            
-            │                                                                          │───────────┐
-            │                                                                          │           │
+            │  ↑↓/jk move · Enter/→ detail · a all · r refresh                         │───────────┐
+            │  (lists are time-sorted; a shows done/declined items)                    │           │
             └──────────────────────────────────────────────────────────────────────────┘───────────┘
 HELP │ idle │ session: + new chat │ ○ ws offline │ ctx —                              press any key

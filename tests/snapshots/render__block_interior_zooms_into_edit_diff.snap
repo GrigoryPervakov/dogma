@@ -1,23 +1,23 @@
 ---
 source: tests/render.rs
-assertion_line: 304
+assertion_line: 339
 expression: "render_buf(&mut app, 80, 18)"
 ---
 dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory 
-Sessions  · / search        # edit example                                      
-────────────────────────────┏ ▶ assistant  ·  block 1/1  L1/8━━━━━━━━━━━━━━━━━━┓
-  + new chat               │┃▸ tool · Edit /path/to/file.rs  -3 +4             ┃
-    edit example           │┃- let foo = 1;                                    ┃
-                           │┃- let bar = 2;                                    ┃
-                           │┃- let baz = 3;                                    ┃
-                           │┃+ let foo = 10;                                   ┃
-                           │┃+ let bar = 20;                                   ┃
-                           │┃+ let baz = 30;                                   ┃
-                           │┃+ let quux = 40;                                  ┃
-                           │┃                                                  ┃
-                           │┃                                                  ┃
-                           │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
-                           │┌ input · ↓ or i to focus ─────────────────────────┐
-                           ││                                                  │
-                           │└──────────────────────────────────────────────────┘
+Sessions  · / search          # edit example                                    
+──────────────────────────────┏ ▶ assistant  ·  block 1/1  L1/8━━━━━━━━━━━━━━━━┓
+  + new chat                 │┃▸ tool · Edit /path/to/file.rs  -3 +4           ┃
+    edit example             │┃- let foo = 1;                                  ┃
+                             │┃- let bar = 2;                                  ┃
+                             │┃- let baz = 3;                                  ┃
+                             │┃+ let foo = 10;                                 ┃
+                             │┃+ let bar = 20;                                 ┃
+                             │┃+ let baz = 30;                                 ┃
+                             │┃+ let quux = 40;                                ┃
+                             │┃                                                ┃
+                             │┃                                                ┃
+                             │┗━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━┛
+                             │┌ input · ↓ or i to focus ───────────────────────┐
+                             ││                                                │
+                             │└────────────────────────────────────────────────┘
 NORMAL · block │ idle │ session: edit example │ ○ ws offline │ ctx — ↑↓/jk move

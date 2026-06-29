@@ -22,4 +22,7 @@ pub struct Plan {
     pub updated_at: Option<String>,
     #[serde(default)]
     pub runtime: Option<String>,
+    /// Which Nerve instance this plan came from. Stamped at ingest.
+    #[serde(default, skip)]
+    pub instance: crate::instance::InstanceId,
 }

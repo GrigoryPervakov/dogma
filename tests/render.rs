@@ -10,9 +10,10 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 
 use dogma::api::types::Token;
-use dogma::app::state::{App, Mode};
+use dogma::app::state::{App, InstanceMeta, Mode, WsConnState};
+use dogma::instance::InstanceId;
 use dogma::model::{Block, Message, Plan, Role, Session, Skill, Task, ToolCall, ToolCallStatus};
-use dogma::view::chat::state::SessionKey;
+use dogma::view::chat::state::{SessionKey, SessionRef};
 use dogma::view::chat::{AgentStatus, ChatView, FocusTier};
 use dogma::view::plans::PlansView;
 use dogma::view::skills::SkillsView;
@@ -66,6 +67,7 @@ fn user_session(id: &str, title: &str) -> Session {
         source: Some("web".into()),
         message_count: 5,
         total_cost_usd: 0.0,
+        instance: Default::default(),
     }
 }
 
@@ -81,6 +83,7 @@ fn cron_session(id: &str, title: &str) -> Session {
         source: Some("cron".into()),
         message_count: 2,
         total_cost_usd: 0.0,
+        instance: Default::default(),
     }
 }
 
@@ -162,6 +165,40 @@ fn focus_view_mut<V: 'static>(app: &mut App) -> &mut V {
 // ---------------------------------------------------------------------------
 
 #[test]
+fn merged_sidebar_and_statusbar_distinguish_two_instances() {
+    let mut app = App::with_instances(vec![
+        InstanceMeta::new(InstanceId(0), "local".into(), "http://local:8900".into()),
+        InstanceMeta::new(InstanceId(1), "vm".into(), "http://vm:8900".into()),
+    ]);
+    app.instances[0].ws = WsConnState::Connected;
+    app.instances[1].ws = WsConnState::Connected;
+    with_chat(&mut app, |chat| {
+        let mut s_local = user_session("s1", "refactor the parser");
+        s_local.instance = InstanceId(0);
+        let mut s_vm = user_session("s2", "deploy pipeline");
+        s_vm.instance = InstanceId(1);
+        chat.sessions = vec![s_local, s_vm];
+        chat.sessions_loaded = true;
+    });
+    insta::assert_snapshot!(render_buf(&mut app, 100, 16));
+}
+
+#[test]
+fn new_chat_picker_lists_instances() {
+    let mut app = App::with_instances(vec![
+        InstanceMeta::new(InstanceId(0), "local".into(), "http://local:8900".into()),
+        InstanceMeta::new(InstanceId(1), "vm".into(), "http://vm:8900".into()),
+    ]);
+    app.instances[0].ws = WsConnState::Connected;
+    app.instances[1].ws = WsConnState::Connected;
+    with_chat(&mut app, |chat| {
+        chat.sessions_loaded = true;
+        chat.show_new_chat_picker(&[InstanceId(0), InstanceId(1)]);
+    });
+    insta::assert_snapshot!(render_buf(&mut app, 100, 16));
+}
+
+#[test]
 fn boot_sessions_focus_user_and_system_groups() {
     let mut app = app_with_sessions(vec![
         user_session("s1", "refactor the parser"),
@@ -193,7 +230,7 @@ fn chatblocks_with_user_and_assistant_messages_selected_last() {
         chat.sessions_selected = 1;
         chat.focus = FocusTier::ChatBlocks;
         // Simulate the load: select last item.
-        let last = chat.history["s1"]
+        let last = chat.history[&SessionRef::from("s1")]
             .iter()
             .map(|m| m.blocks.len())
             .sum::<usize>()
@@ -352,46 +389,52 @@ fn tasks_tab_list_and_detail() {
     let mut app = App::new("http://test".into(), Token::empty());
     {
         let v = focus_view_mut::<TasksView>(&mut app);
-        v.apply_list_loaded(Ok(vec![
-            Task {
-                id: "t1".into(),
-                title: "Fix flaky webhook test".into(),
-                status: "in_progress".into(),
-                source: Some("github".into()),
-                source_url: Some("https://github.com/x/y/issues/42".into()),
-                deadline: Some("2026-05-02 12:00".into()),
-                created_at: Some("2026-04-25 10:00:00".into()),
-                updated_at: Some("2026-04-29 09:00:00".into()),
-                content: None,
-            },
-            Task {
-                id: "t2".into(),
-                title: "Review PR #175".into(),
-                status: "pending".into(),
-                source: None,
-                source_url: None,
-                deadline: None,
-                created_at: Some("2026-04-28 08:00:00".into()),
-                updated_at: Some("2026-04-29 09:00:00".into()),
-                content: None,
-            },
-            Task {
-                id: "t3".into(),
-                title: "Rebase main".into(),
-                status: "done".into(),
-                source: None,
-                source_url: None,
-                deadline: None,
-                created_at: Some("2026-04-26 12:00:00".into()),
-                updated_at: Some("2026-04-29 08:30:00".into()),
-                content: None,
-            },
-        ]));
+        v.apply_list_loaded(
+            InstanceId::PRIMARY,
+            Ok(vec![
+                Task {
+                    id: "t1".into(),
+                    instance: Default::default(),
+                    title: "Fix flaky webhook test".into(),
+                    status: "in_progress".into(),
+                    source: Some("github".into()),
+                    source_url: Some("https://github.com/x/y/issues/42".into()),
+                    deadline: Some("2026-05-02 12:00".into()),
+                    created_at: Some("2026-04-25 10:00:00".into()),
+                    updated_at: Some("2026-04-29 09:00:00".into()),
+                    content: None,
+                },
+                Task {
+                    id: "t2".into(),
+                    instance: Default::default(),
+                    title: "Review PR #175".into(),
+                    status: "pending".into(),
+                    source: None,
+                    source_url: None,
+                    deadline: None,
+                    created_at: Some("2026-04-28 08:00:00".into()),
+                    updated_at: Some("2026-04-29 09:00:00".into()),
+                    content: None,
+                },
+                Task {
+                    id: "t3".into(),
+                    instance: Default::default(),
+                    title: "Rebase main".into(),
+                    status: "done".into(),
+                    source: None,
+                    source_url: None,
+                    deadline: None,
+                    created_at: Some("2026-04-26 12:00:00".into()),
+                    updated_at: Some("2026-04-29 08:30:00".into()),
+                    content: None,
+                },
+            ]),
+        );
         v.apply_detail_loaded(
-            "t1",
+            InstanceId::PRIMARY,            "t1",
             Ok(Task {
                 id: "t1".into(),
-                title: "Fix flaky webhook test".into(),
+                instance: Default::default(),                title: "Fix flaky webhook test".into(),
                 status: "in_progress".into(),
                 source: Some("github".into()),
                 source_url: Some("https://github.com/x/y/issues/42".into()),
@@ -413,35 +456,40 @@ fn plans_tab_list_and_detail() {
     let mut app = App::new("http://test".into(), Token::empty());
     {
         let v = focus_view_mut::<PlansView>(&mut app);
-        v.apply_list_loaded(Ok(vec![
-            Plan {
-                id: "p1".into(),
-                task_id: Some("t1".into()),
-                status: "pending".into(),
-                title: Some("Refactor the parser pipeline".into()),
-                content: None,
-                feedback: None,
-                created_at: Some("2026-04-29 11:00:00".into()),
-                updated_at: Some("2026-04-29 11:00:00".into()),
-                runtime: Some("claude".into()),
-            },
-            Plan {
-                id: "p2".into(),
-                task_id: Some("t1".into()),
-                status: "approved".into(),
-                title: Some("Update webhook validation".into()),
-                content: None,
-                feedback: None,
-                created_at: Some("2026-04-28 09:00:00".into()),
-                updated_at: Some("2026-04-29 10:00:00".into()),
-                runtime: Some("claude".into()),
-            },
-        ]));
+        v.apply_list_loaded(
+            InstanceId::PRIMARY,
+            Ok(vec![
+                Plan {
+                    id: "p1".into(),
+                    instance: Default::default(),
+                    task_id: Some("t1".into()),
+                    status: "pending".into(),
+                    title: Some("Refactor the parser pipeline".into()),
+                    content: None,
+                    feedback: None,
+                    created_at: Some("2026-04-29 11:00:00".into()),
+                    updated_at: Some("2026-04-29 11:00:00".into()),
+                    runtime: Some("claude".into()),
+                },
+                Plan {
+                    id: "p2".into(),
+                    instance: Default::default(),
+                    task_id: Some("t1".into()),
+                    status: "approved".into(),
+                    title: Some("Update webhook validation".into()),
+                    content: None,
+                    feedback: None,
+                    created_at: Some("2026-04-28 09:00:00".into()),
+                    updated_at: Some("2026-04-29 10:00:00".into()),
+                    runtime: Some("claude".into()),
+                },
+            ]),
+        );
         v.apply_detail_loaded(
-            "p1",
+            InstanceId::PRIMARY,            "p1",
             Ok(Plan {
                 id: "p1".into(),
-                task_id: Some("t1".into()),
+                instance: Default::default(),                task_id: Some("t1".into()),
                 status: "pending".into(),
                 title: Some("Refactor the parser pipeline".into()),
                 content: Some(
@@ -463,43 +511,49 @@ fn skills_tab_list_and_detail() {
     let mut app = App::new("http://test".into(), Token::empty());
     {
         let v = focus_view_mut::<SkillsView>(&mut app);
-        v.apply_list_loaded(Ok(vec![
-            Skill {
-                id: "example-dev".into(),
-                name: "example-dev".into(),
-                description: Some("Example project dev workflow".into()),
-                version: Some("1.0".into()),
-                enabled: true,
-                content: None,
-                usage_count: Some(42),
-                last_used_at: Some("2026-04-28 14:00:00".into()),
-            },
-            Skill {
-                id: "nerve-dev".into(),
-                name: "nerve-dev".into(),
-                description: Some("Nerve backend / frontend dev".into()),
-                version: Some("1.0".into()),
-                enabled: true,
-                content: None,
-                usage_count: Some(7),
-                last_used_at: None,
-            },
-            Skill {
-                id: "old-skill".into(),
-                name: "old-skill".into(),
-                description: Some("Disabled legacy skill".into()),
-                version: Some("0.3".into()),
-                enabled: false,
-                content: None,
-                usage_count: Some(0),
-                last_used_at: None,
-            },
-        ]));
+        v.apply_list_loaded(
+            InstanceId::PRIMARY,
+            Ok(vec![
+                Skill {
+                    id: "example-dev".into(),
+                    instance: Default::default(),
+                    name: "example-dev".into(),
+                    description: Some("Example project dev workflow".into()),
+                    version: Some("1.0".into()),
+                    enabled: true,
+                    content: None,
+                    usage_count: Some(42),
+                    last_used_at: Some("2026-04-28 14:00:00".into()),
+                },
+                Skill {
+                    id: "nerve-dev".into(),
+                    instance: Default::default(),
+                    name: "nerve-dev".into(),
+                    description: Some("Nerve backend / frontend dev".into()),
+                    version: Some("1.0".into()),
+                    enabled: true,
+                    content: None,
+                    usage_count: Some(7),
+                    last_used_at: None,
+                },
+                Skill {
+                    id: "old-skill".into(),
+                    instance: Default::default(),
+                    name: "old-skill".into(),
+                    description: Some("Disabled legacy skill".into()),
+                    version: Some("0.3".into()),
+                    enabled: false,
+                    content: None,
+                    usage_count: Some(0),
+                    last_used_at: None,
+                },
+            ]),
+        );
         v.apply_detail_loaded(
-            "example-dev",
+            InstanceId::PRIMARY,            "example-dev",
             Ok(Skill {
                 id: "example-dev".into(),
-                name: "example-dev".into(),
+                instance: Default::default(),                name: "example-dev".into(),
                 description: Some("Example project dev workflow".into()),
                 version: Some("1.0".into()),
                 enabled: true,

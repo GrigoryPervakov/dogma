@@ -1,6 +1,6 @@
 ---
 source: tests/render.rs
-assertion_line: 517
+assertion_line: 569
 expression: "render_buf(&mut app, 100, 22)"
 ---
 dogma   chat    notifs    tasks    plans   [skills]   cron    sources    memory    diag             
@@ -24,4 +24,4 @@ Skills (3)                          # example-dev
                                    │                                                                
                                    │                                                                
                                    │                                                                
-NORMAL · skills │ ○ ws offline                 ↑↓/jk move · Enter open · r refresh · Tab switch tab
+NORMAL · skills │ ○ ws offline                          ↑↓/jk move · Enter open · a all · r refresh

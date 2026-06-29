@@ -23,6 +23,9 @@ pub struct Skill {
     pub usage_count: Option<u64>,
     #[serde(default, alias = "last_used")]
     pub last_used_at: Option<String>,
+    /// Which Nerve instance this skill came from. Stamped at ingest.
+    #[serde(default, skip)]
+    pub instance: crate::instance::InstanceId,
 }
 
 fn default_true() -> bool {

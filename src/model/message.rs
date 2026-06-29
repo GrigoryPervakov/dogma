@@ -96,9 +96,11 @@ pub enum Role {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Block {
     Text {
+        #[serde(default, deserialize_with = "null_to_default")]
         content: String,
     },
     Thinking {
+        #[serde(default, deserialize_with = "null_to_default")]
         content: String,
     },
     ToolCall(ToolCall),
@@ -128,6 +130,7 @@ pub enum Block {
 pub struct ToolCall {
     #[serde(default)]
     pub tool_use_id: String,
+    #[serde(default, deserialize_with = "null_to_default")]
     pub tool: String,
     #[serde(default)]
     pub input: Value,
@@ -185,5 +188,21 @@ mod tests {
             "blocks":[{"type":"some_future_kind","data":42}]}]"#;
         let msgs: Vec<Message> = serde_json::from_str(json).unwrap();
         assert!(matches!(msgs[0].blocks[0], Block::Unknown));
+    }
+
+    /// A text/tool block with null or missing required fields must not fail the
+    /// parse — a different-version instance may serialize them that way.
+    #[test]
+    fn null_or_missing_content_and_tool_default_instead_of_failing() {
+        let json = r#"[{"id":1,"session_id":"s","role":"assistant",
+            "blocks":[
+                {"type":"text","content":null},
+                {"type":"text"},
+                {"type":"tool_call","tool":null}
+            ]}]"#;
+        let msgs: Vec<Message> = serde_json::from_str(json).expect("must parse with defaults");
+        assert!(matches!(&msgs[0].blocks[0], Block::Text { content } if content.is_empty()));
+        assert!(matches!(&msgs[0].blocks[1], Block::Text { content } if content.is_empty()));
+        assert!(matches!(&msgs[0].blocks[2], Block::ToolCall(tc) if tc.tool.is_empty()));
     }
 }

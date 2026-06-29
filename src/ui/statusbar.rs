@@ -45,7 +45,7 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
             spans.extend(session_spans(chat));
 
             push_sep(&mut spans);
-            spans.extend(ws_spans(&app.ws));
+            spans.extend(conn_spans(app));
 
             push_sep(&mut spans);
             spans.extend(ctx_spans(chat));
@@ -60,7 +60,7 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
         }
     } else {
         push_sep(&mut spans);
-        spans.extend(ws_spans(&app.ws));
+        spans.extend(conn_spans(app));
     }
 
     // ----- right hint --------------------------------------------------------
@@ -174,19 +174,55 @@ fn agent_spans(chat: &ChatView) -> Vec<Span<'static>> {
 }
 
 fn session_spans(chat: &ChatView) -> Vec<Span<'static>> {
-    let label = match chat.current_session_id() {
-        Some(id) => {
+    let label = match chat.current_session_ref() {
+        Some(sref) => {
             let title = chat
                 .sessions
                 .iter()
-                .find(|s| s.id == id)
+                .find(|s| s.instance == sref.instance && s.id == sref.id)
                 .and_then(|s| s.title.clone())
-                .unwrap_or_else(|| id.to_string());
+                .unwrap_or_else(|| sref.id.clone());
             format!("session: {}", truncate(&title, 40))
         }
         None => "session: + new chat".to_string(),
     };
     vec![Span::raw(label)]
+}
+
+/// Connection summary: a single `ws` dot when one instance is connected, or a
+/// per-instance `● label · ◆ label` strip (each in its instance color, dimmed
+/// when offline) when several are.
+fn conn_spans(app: &App) -> Vec<Span<'static>> {
+    if app.instances.len() <= 1 {
+        let ws = app
+            .instances
+            .first()
+            .map(|i| i.ws.clone())
+            .unwrap_or(WsConnState::Disconnected);
+        return ws_spans(&ws);
+    }
+    let mut out: Vec<Span<'static>> = Vec::new();
+    for (i, meta) in app.instances.iter().enumerate() {
+        if i > 0 {
+            out.push(Span::styled(
+                " · ",
+                Style::default().add_modifier(Modifier::DIM),
+            ));
+        }
+        let mut style = Style::default().fg(crate::ui::theme::instance_color(meta.id));
+        if !matches!(meta.ws, WsConnState::Connected) {
+            style = style.add_modifier(Modifier::DIM);
+        }
+        out.push(Span::styled(
+            format!(
+                "{} {}",
+                crate::ui::theme::instance_sigil(meta.id),
+                meta.label
+            ),
+            style,
+        ));
+    }
+    out
 }
 
 fn ws_spans(ws: &WsConnState) -> Vec<Span<'static>> {
@@ -301,13 +337,17 @@ fn right_hint(app: &App) -> String {
                         "↑↓ move · Space select · Enter submit · Esc skip".into()
                     }
                     Some(FocusTier::Files) => "↑↓ files · Enter diff · Esc back".into(),
+                    Some(FocusTier::NewChatPicker) => {
+                        "↑↓ pick instance · Enter ok · Esc cancel".into()
+                    }
                     None => "press : for command, ? for help".into(),
                 }
             } else {
                 match active_view_id(app) {
                     Some("tasks") | Some("plans") | Some("skills") => {
-                        "↑↓/jk move · Enter open · r refresh · Tab switch tab".into()
+                        "↑↓/jk move · Enter open · a all · r refresh".into()
                     }
+                    Some("notifs") => "↑↓ move · 1-9 answer · d dismiss · a all · r refresh".into(),
                     _ => "Tab switch tab · ? help · q quit".into(),
                 }
             }
@@ -335,6 +375,7 @@ fn mode_label(app: &App) -> String {
                     FocusTier::Insert => return "INSERT".into(),
                     FocusTier::Poll => return "POLL".into(),
                     FocusTier::Files => return "FILES".into(),
+                    FocusTier::NewChatPicker => return "NEW CHAT".into(),
                 };
                 return format!("NORMAL · {tier}");
             }

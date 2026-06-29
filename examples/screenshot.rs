@@ -10,10 +10,10 @@ use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::style::{Color, Modifier};
 
-use dogma::api::types::Token;
-use dogma::app::state::App;
+use dogma::app::state::{App, InstanceMeta, WsConnState};
+use dogma::instance::InstanceId;
 use dogma::model::{Block, Message, Role, Session, ToolCall, ToolCallStatus};
-use dogma::view::chat::state::SessionKey;
+use dogma::view::chat::state::{SessionKey, SessionRef};
 use dogma::view::chat::{ChatView, FocusTier};
 
 // 80 cols x 27 rows of terminal, drawn into the body of an 800x600 window.
@@ -28,8 +28,19 @@ const BG: &str = "#11111b"; // window / terminal background
 const FG: &str = "#cdd6f4"; // default foreground
 
 fn main() {
-    let mut app = App::new("http://example.dev:8900".into(), Token::empty());
-    app.ws = dogma::app::state::WsConnState::Connected;
+    // Two connected instances so the screenshot shows the merged, per-instance
+    // badged UI ("local" + "vm").
+    let mut app = App::with_instances(vec![
+        InstanceMeta::new(
+            InstanceId(0),
+            "local".into(),
+            "http://local.dev:8900".into(),
+        ),
+        InstanceMeta::new(InstanceId(1), "vm".into(), "http://vm.dev:8900".into()),
+    ]);
+    for inst in &mut app.instances {
+        inst.ws = WsConnState::Connected;
+    }
     seed(chat_mut(&mut app));
     let backend = TestBackend::new(COLS, ROWS);
     let mut term = Terminal::new(backend).expect("terminal");
@@ -44,12 +55,14 @@ fn chat_mut(app: &mut App) -> &mut ChatView {
         .expect("ChatView is first")
 }
 
-fn session(id: &str, title: &str, source: &str) -> Session {
-    serde_json::from_value(serde_json::json!({
+fn session(id: &str, title: &str, source: &str, inst: InstanceId) -> Session {
+    let mut s: Session = serde_json::from_value(serde_json::json!({
         "id": id, "title": title, "source": source,
         "updated_at": "2026-04-29 14:32:00",
     }))
-    .unwrap()
+    .unwrap();
+    s.instance = inst;
+    s
 }
 
 fn user_msg(content: &str) -> Message {
@@ -79,15 +92,18 @@ fn tool(name: &str, input: serde_json::Value, result: Option<&str>) -> Block {
 }
 
 fn seed(chat: &mut ChatView) {
+    let local = InstanceId(0);
+    let vm = InstanceId(1);
     chat.sessions = vec![
-        session("s1", "refactor the parser", "web"),
-        session("s2", "api client retry/backoff", "web"),
-        session("s3", "write integration tests", "web"),
-        session("cron:pr", "Cron: pr-dashboard", "cron"),
+        session("s1", "refactor the parser", "web", local),
+        session("s2", "api client retry/backoff", "web", vm),
+        session("s3", "write integration tests", "web", local),
+        session("cron:pr", "Cron: pr-dashboard", "cron", vm),
     ];
     chat.sessions_loaded = true;
+    let s1 = SessionRef::new(local, "s1");
     chat.history.insert(
-        "s1".into(),
+        s1.clone(),
         vec![
             user_msg("Look at src/parser.rs and tell me if the error handling is consistent."),
             assistant(vec![
@@ -113,16 +129,16 @@ fn seed(chat: &mut ChatView) {
             ]),
         ],
     );
-    chat.current = SessionKey::Real("s1".into());
+    chat.current = SessionKey::Real(s1.clone());
     chat.sessions_selected = 1;
     chat.focus = FocusTier::ChatBlocks;
-    let last = chat.history["s1"]
+    let last = chat.history[&s1]
         .iter()
         .map(|m| m.blocks.len())
         .sum::<usize>()
         - 1;
     chat.ui
-        .entry(SessionKey::Real("s1".into()))
+        .entry(SessionKey::Real(s1))
         .or_default()
         .selected_block = Some(last);
 }
@@ -153,7 +169,7 @@ fn buffer_to_svg(buf: &Buffer) -> String {
     }
     out.push_str(
         "<text x=\"400\" y=\"23\" text-anchor=\"middle\" fill=\"#6c7086\" \
-         font-size=\"13\">Dogma: example.dev</text>\n",
+         font-size=\"13\">Dogma: local +1</text>\n",
     );
 
     // Background rects: merge horizontal runs of identical non-default bg.

@@ -57,12 +57,27 @@ pub fn run_command(app: &mut App, line: &str) -> Vec<Action> {
         }
         "reload" => {
             // Rebuild the current chat from scratch (unsticks a hung stream),
-            // then refresh the sessions list.
+            // then refresh the sessions list on every instance.
             let mut actions = chat_command(app, ChatCommand::Reload);
-            actions.push(Action::Http(crate::api::types::HttpReq::ListSessions));
+            for &instance in &app.instance_ids {
+                actions.push(Action::Http {
+                    instance,
+                    req: crate::api::types::HttpReq::ListSessions,
+                });
+            }
             actions
         }
-        "new" => chat_command(app, ChatCommand::NewChat(opt_string(rest))),
+        "new" => {
+            let actions = chat_command(app, ChatCommand::NewChat(opt_string(rest)));
+            // With several instances connected, ask which one before typing.
+            if app.instances.len() > 1 {
+                let ids = app.instance_ids.clone();
+                if let Some(chat) = crate::app::update::chat_view_mut(app) {
+                    chat.show_new_chat_picker(&ids);
+                }
+            }
+            actions
+        }
         "fork" => chat_command(app, ChatCommand::Fork(opt_string(rest))),
         "resume" => chat_command(app, ChatCommand::Resume),
         "rename" => chat_command(app, ChatCommand::Rename(opt_string(rest))),
@@ -90,8 +105,10 @@ fn switch_to_view(app: &mut App, name: &str) -> Vec<Action> {
     };
     app.current_view = idx;
     let mut actions = Vec::new();
+    let ids = app.instance_ids.clone();
     let mut ctx = ViewCtx {
         app_actions: &mut actions,
+        instances: &ids,
     };
     app.views[idx].on_focus(&mut ctx);
     app.mark_dirty();

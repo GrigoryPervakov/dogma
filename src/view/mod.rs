@@ -12,16 +12,40 @@ use crossterm::event::KeyEvent;
 use ratatui::Frame;
 use ratatui::layout::Rect;
 
+use crate::api::types::{HttpReq, WsClientMsg};
 use crate::app::action::Action;
+use crate::instance::InstanceId;
 
-/// Per-render context — where views push Actions to be dispatched.
+/// Per-key/per-event context — where views push instance-routed Actions, and
+/// the set of instances they can fan a request out to (e.g. initial list loads).
 pub struct ViewCtx<'a> {
     pub app_actions: &'a mut Vec<Action>,
+    pub instances: &'a [InstanceId],
 }
 
 impl<'a> ViewCtx<'a> {
     pub fn push(&mut self, a: Action) {
         self.app_actions.push(a);
+    }
+
+    /// Route a WS frame to one instance.
+    pub fn ws(&mut self, instance: InstanceId, msg: WsClientMsg) {
+        self.app_actions.push(Action::Ws { instance, msg });
+    }
+
+    /// Route an HTTP request to one instance.
+    pub fn http(&mut self, instance: InstanceId, req: HttpReq) {
+        self.app_actions.push(Action::Http { instance, req });
+    }
+
+    /// Issue the same HTTP request to every connected instance (list loads).
+    pub fn http_all(&mut self, req: HttpReq) {
+        for &instance in self.instances {
+            self.app_actions.push(Action::Http {
+                instance,
+                req: req.clone(),
+            });
+        }
     }
 }
 
@@ -60,6 +84,21 @@ pub trait View: std::any::Any {
 pub struct ViewRenderCtx<'a> {
     pub mode: crate::app::state::Mode,
     pub command_buffer: &'a str,
-    pub ws: &'a crate::app::state::WsConnState,
-    pub server: &'a str,
+    /// All connected instances — used to render per-instance badges (color +
+    /// sigil) when there's more than one.
+    pub instances: &'a [crate::app::state::InstanceMeta],
+}
+
+impl ViewRenderCtx<'_> {
+    /// Whether to show per-instance badges (more than one instance connected).
+    pub fn multi_instance(&self) -> bool {
+        self.instances.len() > 1
+    }
+
+    pub fn instance(
+        &self,
+        id: crate::instance::InstanceId,
+    ) -> Option<&crate::app::state::InstanceMeta> {
+        self.instances.get(id.index())
+    }
 }

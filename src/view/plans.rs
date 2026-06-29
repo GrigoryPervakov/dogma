@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::api::types::HttpReq;
+use crate::instance::InstanceId;
 use crate::model::Plan;
 use crate::view::list_detail::{ListDetail, ListDetailModel, meta_line, truncate};
 
@@ -27,6 +28,26 @@ impl ListDetailModel for PlanModel {
     }
     fn item_id(p: &Plan) -> &str {
         &p.id
+    }
+    fn item_instance(p: &Plan) -> InstanceId {
+        p.instance
+    }
+    fn set_instance(p: &mut Plan, instance: InstanceId) {
+        p.instance = instance;
+    }
+    fn is_active(p: &Plan) -> bool {
+        // Hide decided/dead/finished plans; keep pending/proposed/revision/
+        // implementing and any unknown state visible.
+        !matches!(
+            p.status.as_str(),
+            "approved" | "declined" | "superseded" | "done" | "completed" | "implemented"
+        )
+    }
+    fn sort_key(p: &Plan) -> String {
+        p.updated_at
+            .clone()
+            .or_else(|| p.created_at.clone())
+            .unwrap_or_default()
     }
     fn detail_title(p: &Plan) -> &str {
         p.title.as_deref().unwrap_or(if p.id.is_empty() {
@@ -71,5 +92,25 @@ impl ListDetailModel for PlanModel {
             out.push(meta_line("feedback", f, 10));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plan(status: &str) -> Plan {
+        serde_json::from_value(serde_json::json!({ "id": "p", "status": status })).unwrap()
+    }
+
+    #[test]
+    fn decided_plans_are_inactive() {
+        assert!(PlanModel::is_active(&plan("pending")));
+        assert!(PlanModel::is_active(&plan("proposed")));
+        assert!(PlanModel::is_active(&plan("implementing")));
+        assert!(!PlanModel::is_active(&plan("approved")));
+        assert!(!PlanModel::is_active(&plan("declined")));
+        assert!(!PlanModel::is_active(&plan("superseded")));
+        assert!(!PlanModel::is_active(&plan("done")));
     }
 }

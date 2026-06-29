@@ -11,15 +11,32 @@ A terminal UI for [Nerve](https://github.com/ClickHouse/nerve) — drive your ag
 - **Keyboard-driven navigation** — tab bar, `:` command palette with autocomplete (singular/plural aliases), `?` for help.
 - **Live chat** — token streaming, markdown with syntax-highlighted code, collapsible tool/thinking blocks, full-screen block zoom, sub-agent side panel.
 - **Interactive** — answer `AskUserQuestion` polls inline, watch a live task / background-jobs panel, see the chat reframe while the agent streams.
-- **Tabs** — chat, notifications (answer & dismiss, red alert when pending), tasks, plans, skills.
-- **Survives long sessions** — the password is prompted once and kept in memory to silently reissue the auth token when it expires (~24h). Nothing is written to disk.
+- **Tabs** — chat, notifications (answer & dismiss, red alert when pending), tasks, plans, skills. Lists show active items first, sorted by time; press `a` to reveal answered/done/declined ones.
+- **Multiple instances** — drive several Nerve servers from one UI. Their sessions, notifications, tasks, plans and skills merge into single time-sorted lists, each row tagged by a colored sigil + name (`● local` / `◆ vm`). Starting a new chat asks which instance it lands on; an unreachable instance shows offline and reconnects on its own.
+- **Survives long sessions** — the password is prompted once (or read from config) and kept in memory to silently reissue the auth token when it expires (~24h). Tokens are never written to disk.
 
 ## Build & run
 
 ```sh
 cargo build --release
-./target/release/dogma            # connects to http://127.0.0.1:8900 by default
-./target/release/dogma --help     # other options
+./target/release/dogma                       # http://127.0.0.1:8900 by default
+./target/release/dogma --server vm=http://my-dev-vm:8900            # one named instance
+./target/release/dogma --server lh=http://127.0.0.1:8900 \
+                       --server vm=http://my-dev-vm:8900            # several at once
+./target/release/dogma --help                 # other options
+```
+
+Instances can also be declared in `~/.dogma/config.toml` (a repeated `--server` flag overrides it):
+
+```toml
+[[servers]]
+name = "lh"
+url  = "http://127.0.0.1:8900"
+# password = "…"   # optional — prompted if omitted; keep the file chmod 600
+
+[[servers]]
+name = "vm"
+url  = "http://my-dev-vm:8900"
 ```
 
 Requires a running Nerve API server. Press `?` inside the app for the full keymap.

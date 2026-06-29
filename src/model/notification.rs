@@ -30,6 +30,9 @@ pub struct Notification {
     pub created_at: Option<String>,
     #[serde(default)]
     pub session_title: Option<String>,
+    /// Which Nerve instance this notification came from. Stamped at ingest.
+    #[serde(default, skip)]
+    pub instance: crate::instance::InstanceId,
 }
 
 impl Notification {

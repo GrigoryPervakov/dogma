@@ -1,6 +1,8 @@
 //! App — the owned state container.
 
 use crate::api::types::Token;
+use crate::config::host_label;
+use crate::instance::InstanceId;
 use crate::view::View;
 use crate::view::chat::ChatView;
 use crate::view::notifications::NotificationsView;
@@ -32,25 +34,35 @@ pub enum WsConnState {
     AuthRejected,
 }
 
-pub struct AuthState {
+/// One connected Nerve instance: its identity, friendly label, server URL, and
+/// live WS connection state. dogma merges resources from every instance into
+/// one UI, distinguishing them by `id` (color + sigil via `ui::theme`).
+#[derive(Debug, Clone)]
+pub struct InstanceMeta {
+    pub id: InstanceId,
+    pub label: String,
     pub server: String,
-    pub token: Token,
+    pub ws: WsConnState,
 }
 
-impl std::fmt::Debug for AuthState {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AuthState")
-            .field("server", &self.server)
-            .field("token", &self.token)
-            .finish()
+impl InstanceMeta {
+    pub fn new(id: InstanceId, label: String, server: String) -> Self {
+        Self {
+            id,
+            label,
+            server,
+            ws: WsConnState::Disconnected,
+        }
     }
 }
 
 pub struct App {
     pub mode: Mode,
     pub command_buffer: String,
-    pub auth: AuthState,
-    pub ws: WsConnState,
+    /// One per connected Nerve server, indexed by `InstanceId`.
+    pub instances: Vec<InstanceMeta>,
+    /// `instances` ids precomputed for fan-out (handed to views via `ViewCtx`).
+    pub instance_ids: Vec<InstanceId>,
     pub views: Vec<Box<dyn View>>,
     pub current_view: usize,
     pub fatal: Option<String>,
@@ -59,7 +71,14 @@ pub struct App {
 }
 
 impl App {
-    pub fn new(server: String, token: Token) -> Self {
+    /// Single-instance constructor (tests, the screenshot example, and a plain
+    /// one-server launch). Token is unused now that auth lives in the workers.
+    pub fn new(server: String, _token: Token) -> Self {
+        let label = host_label(&server).to_string();
+        Self::with_instances(vec![InstanceMeta::new(InstanceId::PRIMARY, label, server)])
+    }
+
+    pub fn with_instances(instances: Vec<InstanceMeta>) -> Self {
         let mut views: Vec<Box<dyn View>> = vec![
             Box::new(ChatView::new()),
             Box::new(NotificationsView::new()),
@@ -76,17 +95,29 @@ impl App {
             views.push(Box::new(StubView::new(id, t)));
         }
 
+        let instance_ids = instances.iter().map(|i| i.id).collect();
         Self {
             mode: Mode::Normal,
             command_buffer: String::new(),
-            auth: AuthState { server, token },
-            ws: WsConnState::default(),
+            instances,
+            instance_ids,
             views,
             current_view: 0,
             fatal: None,
             should_quit: false,
             dirty: true,
         }
+    }
+
+    /// Whether more than one instance is connected — gates per-instance badges
+    /// so a single-server launch looks exactly as before.
+    pub fn multi_instance(&self) -> bool {
+        self.instances.len() > 1
+    }
+
+    /// Mutable access to an instance's metadata (e.g. to update its WS state).
+    pub fn instance_mut(&mut self, id: InstanceId) -> Option<&mut InstanceMeta> {
+        self.instances.get_mut(id.index())
     }
 
     pub fn current_view_idx(&self) -> usize {

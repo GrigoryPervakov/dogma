@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::api::types::HttpReq;
+use crate::instance::InstanceId;
 use crate::model::Skill;
 use crate::view::list_detail::{ListDetail, ListDetailModel, meta_line, truncate};
 
@@ -27,6 +28,16 @@ impl ListDetailModel for SkillModel {
     }
     fn item_id(s: &Skill) -> &str {
         &s.id
+    }
+    fn item_instance(s: &Skill) -> InstanceId {
+        s.instance
+    }
+    fn set_instance(s: &mut Skill, instance: InstanceId) {
+        s.instance = instance;
+    }
+    fn sort_key(s: &Skill) -> String {
+        // Recently-used first; never-used (no timestamp) sort last.
+        s.last_used_at.clone().unwrap_or_default()
     }
     fn detail_title(s: &Skill) -> &str {
         &s.name

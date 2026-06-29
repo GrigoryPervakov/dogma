@@ -6,25 +6,26 @@
 use serde_json::Value;
 
 use crate::api::types::WsServerMsg;
+use crate::instance::InstanceId;
 use crate::model::{Block, Message, ToolCall, ToolCallStatus};
 use crate::view::ViewCtx;
 
 use super::state::{
-    AgentStatus, ChatView, FocusTier, PendingInteraction, SessionKey, SubAgentPanel,
+    AgentStatus, ChatView, FocusTier, PendingInteraction, SessionKey, SessionRef, SubAgentPanel,
 };
 
-pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
+pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: &mut ViewCtx) {
     // Any event for a session counts as activity — feeds the stall watchdog.
     if let Some(sid) = msg.session_id() {
         view.last_activity
-            .insert(sid.to_string(), std::time::Instant::now());
+            .insert(SessionRef::new(instance, sid), std::time::Instant::now());
     }
     match msg {
         WsServerMsg::SessionSwitched { session_id } => {
             // Server told us our active session. If we don't have a current
             // session yet, adopt it.
             if matches!(view.current, SessionKey::NewChat) && !session_id.is_empty() {
-                view.current = SessionKey::Real(session_id.clone());
+                view.current = SessionKey::Real(SessionRef::new(instance, session_id.clone()));
             }
         }
 
@@ -34,19 +35,20 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             buffered_events,
             ..
         } => {
+            let sref = SessionRef::new(instance, session_id);
             if *is_running {
                 // The server resends the whole in-flight turn — rebuild the
                 // streaming buffer from scratch so a reconnect-replay can't
                 // double-append onto a buffer we already had.
-                view.streaming.remove(session_id);
+                view.streaming.remove(&sref);
                 for ev in buffered_events {
-                    apply(view, ev, ctx);
+                    apply(view, instance, ev, ctx);
                 }
             } else {
                 // The turn is over. Do NOT replay completed events — that
                 // re-drains a turn already in canonical history (the duplicate
                 // bug). Just heal any orphaned live state.
-                heal_session(view, session_id);
+                heal_session(view, &sref);
             }
         }
 
@@ -58,10 +60,10 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             if let Some(parent) = parent_tool_use_id.as_ref() {
                 push_text_to_panel(view, parent, content);
             } else {
-                let m = stream_msg_mut(view, session_id);
+                let sref = SessionRef::new(instance, session_id);
+                let m = stream_msg_mut(view, &sref);
                 append_text(m, content);
-                view.agent_status
-                    .insert(session_id.clone(), AgentStatus::Writing);
+                view.agent_status.insert(sref, AgentStatus::Writing);
             }
         }
 
@@ -73,10 +75,10 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             if let Some(parent) = parent_tool_use_id.as_ref() {
                 push_thinking_to_panel(view, parent, content);
             } else {
-                let m = stream_msg_mut(view, session_id);
+                let sref = SessionRef::new(instance, session_id);
+                let m = stream_msg_mut(view, &sref);
                 append_thinking(m, content);
-                view.agent_status
-                    .insert(session_id.clone(), AgentStatus::Thinking);
+                view.agent_status.insert(sref, AgentStatus::Thinking);
             }
         }
 
@@ -93,10 +95,11 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             if let Some(parent_id) = parent {
                 add_tool_call_to_panel(view, &parent_id, &id, tool, input);
             } else {
-                let m = stream_msg_mut(view, session_id);
+                let sref = SessionRef::new(instance, session_id);
+                let m = stream_msg_mut(view, &sref);
                 upsert_tool_call(m, &id, tool, input, None, false, ToolCallStatus::Streaming);
                 view.agent_status
-                    .insert(session_id.clone(), AgentStatus::Tool(tool.clone()));
+                    .insert(sref, AgentStatus::Tool(tool.clone()));
             }
         }
 
@@ -112,7 +115,8 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             if let Some(parent_id) = parent_tool_use_id.as_ref() {
                 set_tool_result_in_panel(view, parent_id, &id, result, err);
             } else {
-                let m = stream_msg_mut(view, session_id);
+                let sref = SessionRef::new(instance, session_id);
+                let m = stream_msg_mut(view, &sref);
                 set_tool_result(m, &id, result, err);
             }
         }
@@ -123,17 +127,17 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             max_context_tokens,
             num_turns,
         } => {
+            let sref = SessionRef::new(instance, session_id);
             // Move streaming into history.
-            if let Some(streaming) = view.streaming.remove(session_id) {
+            if let Some(streaming) = view.streaming.remove(&sref) {
                 view.history
-                    .entry(session_id.clone())
+                    .entry(sref.clone())
                     .or_default()
                     .push(streaming);
             }
-            view.agent_status
-                .insert(session_id.clone(), AgentStatus::Idle);
+            view.agent_status.insert(sref.clone(), AgentStatus::Idle);
             // Update context usage.
-            let entry = view.context.entry(session_id.clone()).or_default();
+            let entry = view.context.entry(sref.clone()).or_default();
             if let Some(u) = usage.clone() {
                 entry.last = Some(u);
             }
@@ -144,11 +148,11 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
                 entry.num_turns = Some(*n);
             }
             // If follow-tail is on, selection moves to the new last item.
-            if let SessionKey::Real(id) = &view.current
-                && id == session_id
+            if let SessionKey::Real(cur) = &view.current
+                && *cur == sref
             {
                 let total = super::items::count(view.current_history(), view.current_streaming());
-                let key = SessionKey::Real(id.clone());
+                let key = SessionKey::Real(sref.clone());
                 let ui = view.ui.entry(key).or_default();
                 if ui.follow_tail && total > 0 {
                     ui.selected_block = Some(total - 1);
@@ -157,37 +161,40 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
         }
 
         WsServerMsg::Stopped { session_id } => {
-            if let Some(streaming) = view.streaming.get_mut(session_id) {
+            let sref = SessionRef::new(instance, session_id);
+            if let Some(streaming) = view.streaming.get_mut(&sref) {
                 append_text(streaming, "\n[stopped]");
             }
-            if let Some(streaming) = view.streaming.remove(session_id) {
+            if let Some(streaming) = view.streaming.remove(&sref) {
                 view.history
-                    .entry(session_id.clone())
+                    .entry(sref.clone())
                     .or_default()
                     .push(streaming);
             }
-            view.agent_status
-                .insert(session_id.clone(), AgentStatus::Idle);
+            view.agent_status.insert(sref, AgentStatus::Idle);
         }
 
         WsServerMsg::Error { session_id, error } => {
-            if let Some(streaming) = view.streaming.remove(session_id) {
+            let sref = SessionRef::new(instance, session_id);
+            if let Some(streaming) = view.streaming.remove(&sref) {
                 view.history
-                    .entry(session_id.clone())
+                    .entry(sref.clone())
                     .or_default()
                     .push(streaming);
             }
             view.history
-                .entry(session_id.clone())
+                .entry(sref.clone())
                 .or_default()
                 .push(error_message(session_id, error));
-            view.agent_status
-                .insert(session_id.clone(), AgentStatus::Idle);
+            view.agent_status.insert(sref, AgentStatus::Idle);
         }
 
         WsServerMsg::SessionUpdated { session_id, title } => {
             if let Some(t) = title.as_ref()
-                && let Some(s) = view.sessions.iter_mut().find(|s| &s.id == session_id)
+                && let Some(s) = view
+                    .sessions
+                    .iter_mut()
+                    .find(|s| s.instance == instance && &s.id == session_id)
             {
                 s.title = Some(t.clone());
             }
@@ -197,13 +204,17 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             session_id,
             is_running,
         } => {
-            if let Some(s) = view.sessions.iter_mut().find(|s| &s.id == session_id) {
+            if let Some(s) = view
+                .sessions
+                .iter_mut()
+                .find(|s| s.instance == instance && &s.id == session_id)
+            {
                 s.is_running = *is_running;
             }
             // Belt-and-suspenders: the server says the run ended but we may be
             // stuck streaming (a lost Done) — drain the orphaned buffer.
             if !is_running {
-                heal_session(view, session_id);
+                heal_session(view, &SessionRef::new(instance, session_id));
             }
         }
 
@@ -218,7 +229,7 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             // events replay it on session re-entry and must not re-open the poll.
             if !view.answered_interactions.contains(interaction_id) {
                 view.pending_interaction.insert(
-                    session_id.clone(),
+                    SessionRef::new(instance, session_id),
                     PendingInteraction {
                         session_id: session_id.clone(),
                         interaction_id: interaction_id.clone(),
@@ -280,19 +291,19 @@ pub fn apply(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
             ..
         } => {
             view.history
-                .entry(session_id.clone())
+                .entry(SessionRef::new(instance, session_id))
                 .or_default()
                 .push(Message::new_user(session_id.clone(), content.clone()));
         }
 
         WsServerMsg::BackgroundTasksUpdate { session_id, tasks } => {
             view.background_tasks
-                .insert(session_id.clone(), tasks.clone());
+                .insert(SessionRef::new(instance, session_id), tasks.clone());
         }
 
         WsServerMsg::FileChanged { session_id, .. } => {
             // Keep the changed-files list fresh if we're already tracking it.
-            view.refresh_modified_files(session_id, ctx);
+            view.refresh_modified_files(&SessionRef::new(instance, session_id), ctx);
         }
 
         WsServerMsg::SessionResumed { .. }
@@ -314,7 +325,10 @@ fn update_follow_tail_selection(view: &mut ChatView) {
     // Re-pin to the tail wherever the live message list is on screen — that
     // includes the sidebar (Sessions) and while typing (Input/Insert), not
     // just ChatBlocks. Skip the tiers that replace the message area.
-    if matches!(view.focus, FocusTier::BlockInterior | FocusTier::Files) {
+    if matches!(
+        view.focus,
+        FocusTier::BlockInterior | FocusTier::Files | FocusTier::NewChatPicker
+    ) {
         return;
     }
     let total = super::items::count(view.current_history(), view.current_streaming());
@@ -332,27 +346,30 @@ fn update_follow_tail_selection(view: &mut ChatView) {
 /// Drain an orphaned in-flight buffer into history and mark the session idle.
 /// Used when a run ended (server broadcast, stall, reconnect) but no
 /// Done/Stopped/Error reached us — otherwise the chat stays stuck "streaming".
-pub(super) fn heal_session(view: &mut ChatView, session_id: &str) {
-    if let Some(streaming) = view.streaming.remove(session_id)
+pub(super) fn heal_session(view: &mut ChatView, sref: &SessionRef) {
+    if let Some(streaming) = view.streaming.remove(sref)
         && !streaming.blocks.is_empty()
     {
         view.history
-            .entry(session_id.to_string())
+            .entry(sref.clone())
             .or_default()
             .push(streaming);
     }
-    view.agent_status
-        .insert(session_id.to_string(), AgentStatus::Idle);
-    if let Some(s) = view.sessions.iter_mut().find(|s| s.id == session_id) {
+    view.agent_status.insert(sref.clone(), AgentStatus::Idle);
+    if let Some(s) = view
+        .sessions
+        .iter_mut()
+        .find(|s| s.instance == sref.instance && s.id == sref.id)
+    {
         s.is_running = false;
     }
-    view.last_activity.remove(session_id);
+    view.last_activity.remove(sref);
 }
 
-fn stream_msg_mut<'a>(view: &'a mut ChatView, session_id: &str) -> &'a mut Message {
+fn stream_msg_mut<'a>(view: &'a mut ChatView, sref: &SessionRef) -> &'a mut Message {
     view.streaming
-        .entry(session_id.to_string())
-        .or_insert_with(|| Message::new_streaming_assistant(session_id.to_string()))
+        .entry(sref.clone())
+        .or_insert_with(|| Message::new_streaming_assistant(sref.id.clone()))
 }
 
 fn append_text(msg: &mut Message, s: &str) {
@@ -536,16 +553,30 @@ fn error_message(session_id: &str, error: &str) -> Message {
 mod tests {
     use super::*;
     use crate::api::types::WsServerMsg;
+    use crate::instance::InstanceId;
     use proptest::prelude::*;
 
     fn empty_view() -> ChatView {
         ChatView::new()
     }
 
+    const TEST_IDS: [InstanceId; 1] = [InstanceId::PRIMARY];
+
     fn fake_ctx<'a>(actions: &'a mut Vec<crate::app::action::Action>) -> ViewCtx<'a> {
         ViewCtx {
             app_actions: actions,
+            instances: &TEST_IDS,
         }
+    }
+
+    /// Apply a wire message on the primary instance (test convenience).
+    fn play(view: &mut ChatView, msg: &WsServerMsg, ctx: &mut ViewCtx) {
+        super::apply(view, InstanceId::PRIMARY, msg, ctx);
+    }
+
+    /// Primary-instance session ref from a bare id.
+    fn sref(id: &str) -> SessionRef {
+        SessionRef::from(id)
     }
 
     #[test]
@@ -554,7 +585,7 @@ mod tests {
         v.current = SessionKey::Real("s1".into());
         let mut a = Vec::new();
         let mut ctx = fake_ctx(&mut a);
-        apply(
+        play(
             &mut v,
             &WsServerMsg::Token {
                 session_id: "s1".into(),
@@ -563,7 +594,7 @@ mod tests {
             },
             &mut ctx,
         );
-        apply(
+        play(
             &mut v,
             &WsServerMsg::Token {
                 session_id: "s1".into(),
@@ -572,7 +603,7 @@ mod tests {
             },
             &mut ctx,
         );
-        let m = v.streaming.get("s1").unwrap();
+        let m = v.streaming.get(&sref("s1")).unwrap();
         assert_eq!(m.blocks.len(), 1);
         match &m.blocks[0] {
             Block::Text { content } => assert_eq!(content, "Hello world"),
@@ -586,7 +617,7 @@ mod tests {
         v.current = SessionKey::Real("s1".into());
         let mut a = Vec::new();
         let mut ctx = fake_ctx(&mut a);
-        apply(
+        play(
             &mut v,
             &WsServerMsg::ToolUse {
                 session_id: "s1".into(),
@@ -597,7 +628,7 @@ mod tests {
             },
             &mut ctx,
         );
-        apply(
+        play(
             &mut v,
             &WsServerMsg::ToolResult {
                 session_id: "s1".into(),
@@ -608,7 +639,7 @@ mod tests {
             },
             &mut ctx,
         );
-        let m = v.streaming.get("s1").unwrap();
+        let m = v.streaming.get(&sref("s1")).unwrap();
         assert_eq!(m.blocks.len(), 1);
         match &m.blocks[0] {
             Block::ToolCall(tc) => {
@@ -626,7 +657,7 @@ mod tests {
         v.current = SessionKey::Real("s1".into());
         let mut a = Vec::new();
         let mut ctx = fake_ctx(&mut a);
-        apply(
+        play(
             &mut v,
             &WsServerMsg::Token {
                 session_id: "s1".into(),
@@ -635,7 +666,7 @@ mod tests {
             },
             &mut ctx,
         );
-        apply(
+        play(
             &mut v,
             &WsServerMsg::Done {
                 session_id: "s1".into(),
@@ -645,8 +676,8 @@ mod tests {
             },
             &mut ctx,
         );
-        assert!(!v.streaming.contains_key("s1"));
-        assert_eq!(v.history.get("s1").map(|h| h.len()), Some(1));
+        assert!(!v.streaming.contains_key(&sref("s1")));
+        assert_eq!(v.history.get(&sref("s1")).map(|h| h.len()), Some(1));
     }
 
     // -----------------------------------------------------------------------
@@ -675,12 +706,12 @@ mod tests {
     fn session_runtime_reflects_poll_stream_idle() {
         use crate::view::chat::state::SessionRuntime;
         let mut v = empty_view();
-        assert_eq!(v.session_runtime("s1"), SessionRuntime::Idle);
+        assert_eq!(v.session_runtime(&sref("s1")), SessionRuntime::Idle);
 
         v.streaming
             .insert("s1".into(), Message::new_streaming_assistant("s1".into()));
-        assert_eq!(v.session_runtime("s1"), SessionRuntime::Streaming);
-        v.streaming.remove("s1");
+        assert_eq!(v.session_runtime(&sref("s1")), SessionRuntime::Streaming);
+        v.streaming.remove(&sref("s1"));
 
         // A waiting poll outranks streaming.
         v.pending_interaction.insert(
@@ -693,7 +724,7 @@ mod tests {
                 tool_input: serde_json::json!({}),
             },
         );
-        assert_eq!(v.session_runtime("s1"), SessionRuntime::WaitingPoll);
+        assert_eq!(v.session_runtime(&sref("s1")), SessionRuntime::WaitingPoll);
     }
 
     #[test]
@@ -702,7 +733,7 @@ mod tests {
         v.current = SessionKey::Real("s1".into());
         let mut a = Vec::new();
         let mut ctx = fake_ctx(&mut a);
-        apply(&mut v, &question_event("s1", false), &mut ctx);
+        play(&mut v, &question_event("s1", false), &mut ctx);
         assert!(v.active_poll().is_some());
         assert_eq!(v.focus, FocusTier::Poll);
     }
@@ -719,7 +750,7 @@ mod tests {
         let mut a = Vec::new();
         {
             let mut ctx = fake_ctx(&mut a);
-            apply(&mut v, &question_event("s1", false), &mut ctx);
+            play(&mut v, &question_event("s1", false), &mut ctx);
         }
         a.clear();
         let mut ctx = fake_ctx(&mut a);
@@ -734,7 +765,7 @@ mod tests {
         assert!(v.poll_ui.is_none(), "poll_ui not cleared");
         let answered = a.iter().any(|act| matches!(
             act,
-            Action::Ws(WsClientMsg::AnswerInteraction { interaction_id, result: Some(r), denied: false, .. })
+            Action::Ws { msg: WsClientMsg::AnswerInteraction { interaction_id, result: Some(r), denied: false, .. }, .. }
                 if interaction_id == "iid" && r["Q"] == serde_json::json!("B")
         ));
         assert!(answered, "expected AnswerInteraction with B, got {a:?}");
@@ -752,7 +783,7 @@ mod tests {
         let mut a = Vec::new();
         {
             let mut ctx = fake_ctx(&mut a);
-            apply(&mut v, &question_event("s1", true), &mut ctx);
+            play(&mut v, &question_event("s1", true), &mut ctx);
         }
         a.clear();
         let mut ctx = fake_ctx(&mut a);
@@ -762,11 +793,14 @@ mod tests {
         let denied = a.iter().any(|act| {
             matches!(
                 act,
-                Action::Ws(WsClientMsg::AnswerInteraction {
-                    result: None,
-                    denied: true,
+                Action::Ws {
+                    msg: WsClientMsg::AnswerInteraction {
+                        result: None,
+                        denied: true,
+                        ..
+                    },
                     ..
-                })
+                }
             )
         });
         assert!(denied, "expected denied AnswerInteraction, got {a:?}");
@@ -782,7 +816,7 @@ mod tests {
         {
             let mut a = Vec::new();
             let mut ctx = fake_ctx(&mut a);
-            apply(&mut v, &question_event("s1", false), &mut ctx);
+            play(&mut v, &question_event("s1", false), &mut ctx);
             // Answer it.
             v.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut ctx);
         }
@@ -792,7 +826,7 @@ mod tests {
         // Re-entry replays the same interaction through the reducer.
         let mut a = Vec::new();
         let mut ctx = fake_ctx(&mut a);
-        apply(&mut v, &question_event("s1", false), &mut ctx);
+        play(&mut v, &question_event("s1", false), &mut ctx);
 
         assert!(v.poll_ui.is_none(), "answered poll resurrected");
         assert!(
@@ -825,7 +859,7 @@ mod tests {
         let carried = a.iter().any(|act| {
             matches!(
                 act,
-                Action::Http(HttpReq::CreateSession { content: Some(c), .. }) if c == "hello"
+                Action::Http { req: HttpReq::CreateSession { content: Some(c), .. }, .. } if c == "hello"
             )
         });
         assert!(
@@ -910,7 +944,7 @@ mod tests {
 
     fn fresh_chat(session_id: &str) -> ChatView {
         let mut v = ChatView::new();
-        v.current = SessionKey::Real(session_id.to_string());
+        v.current = SessionKey::Real(SessionRef::from(session_id));
         v
     }
 
@@ -918,9 +952,10 @@ mod tests {
         let mut acts = Vec::new();
         let mut ctx = ViewCtx {
             app_actions: &mut acts,
+            instances: &TEST_IDS,
         };
         for ev in events {
-            apply(chat, ev, &mut ctx);
+            play(chat, ev, &mut ctx);
         }
     }
 
@@ -953,8 +988,8 @@ mod tests {
             run_events(&mut chat, &events);
             // Fire one final Done.
             let mut acts = Vec::new();
-            let mut ctx = ViewCtx { app_actions: &mut acts };
-            apply(
+            let mut ctx = ViewCtx { app_actions: &mut acts, instances: &TEST_IDS };
+            play(
                 &mut chat,
                 &WsServerMsg::Done {
                     session_id: "s".into(),
@@ -965,7 +1000,7 @@ mod tests {
                 &mut ctx,
             );
             prop_assert!(
-                !chat.streaming.contains_key("s"),
+                !chat.streaming.contains_key(&sref("s")),
                 "streaming buffer not drained after Done"
             );
         }
@@ -981,10 +1016,10 @@ mod tests {
             // Across all messages currently held (history + streaming),
             // every tool_call block must have a unique tool_use_id.
             let mut all_msgs: Vec<&Message> = Vec::new();
-            if let Some(h) = chat.history.get("s") {
+            if let Some(h) = chat.history.get(&sref("s")) {
                 all_msgs.extend(h.iter());
             }
-            if let Some(s) = chat.streaming.get("s") {
+            if let Some(s) = chat.streaming.get(&sref("s")) {
                 all_msgs.push(s);
             }
             for m in &all_msgs {
@@ -1011,8 +1046,8 @@ mod tests {
 
             let mut replayed = fresh_chat("s");
             let mut acts = Vec::new();
-            let mut ctx = ViewCtx { app_actions: &mut acts };
-            apply(
+            let mut ctx = ViewCtx { app_actions: &mut acts, instances: &TEST_IDS };
+            play(
                 &mut replayed,
                 &WsServerMsg::SessionStatus {
                     session_id: "s".into(),
@@ -1025,8 +1060,8 @@ mod tests {
 
             // Compare the streaming buffer's block shape (we accept that
             // text-block coalescing is the same on both sides).
-            let live_stream = live.streaming.get("s");
-            let replay_stream = replayed.streaming.get("s");
+            let live_stream = live.streaming.get(&sref("s"));
+            let replay_stream = replayed.streaming.get(&sref("s"));
             prop_assert_eq!(
                 live_stream.is_some(),
                 replay_stream.is_some(),
@@ -1040,8 +1075,8 @@ mod tests {
                 );
             }
             // History length must match too.
-            let live_hist = live.history.get("s").map(|h| h.len()).unwrap_or(0);
-            let replay_hist = replayed.history.get("s").map(|h| h.len()).unwrap_or(0);
+            let live_hist = live.history.get(&sref("s")).map(|h| h.len()).unwrap_or(0);
+            let replay_hist = replayed.history.get(&sref("s")).map(|h| h.len()).unwrap_or(0);
             prop_assert_eq!(live_hist, replay_hist, "history length diverged");
         }
     }
@@ -1070,7 +1105,7 @@ mod tests {
             },
         ];
         for ev in &events {
-            apply(&mut v1, ev, &mut ctx);
+            play(&mut v1, ev, &mut ctx);
         }
 
         let mut v2 = empty_view();
@@ -1078,7 +1113,7 @@ mod tests {
         let mut a2 = Vec::new();
         let mut ctx2 = fake_ctx(&mut a2);
         // Replay through SessionStatus.
-        apply(
+        play(
             &mut v2,
             &WsServerMsg::SessionStatus {
                 session_id: "s1".into(),
@@ -1089,8 +1124,8 @@ mod tests {
             &mut ctx2,
         );
 
-        let s1 = v1.streaming.get("s1").unwrap();
-        let s2 = v2.streaming.get("s1").unwrap();
+        let s1 = v1.streaming.get(&sref("s1")).unwrap();
+        let s2 = v2.streaming.get(&sref("s1")).unwrap();
         assert_eq!(s1.blocks.len(), s2.blocks.len());
         match (&s1.blocks[0], &s2.blocks[0]) {
             (Block::ToolCall(a), Block::ToolCall(b)) => {
@@ -1115,7 +1150,7 @@ mod tests {
         let mut ctx = fake_ctx(&mut a);
         // Three text tokens land as one streaming text block; a tool call adds
         // a second block — selection must track the last item.
-        apply(
+        play(
             &mut v,
             &WsServerMsg::Token {
                 session_id: "s1".into(),
@@ -1124,7 +1159,7 @@ mod tests {
             },
             &mut ctx,
         );
-        apply(
+        play(
             &mut v,
             &WsServerMsg::ToolUse {
                 session_id: "s1".into(),
@@ -1162,11 +1197,11 @@ mod tests {
     fn buffered_replay_when_not_running_does_not_duplicate_history() {
         let mut v = fresh_chat("s");
         run_events(&mut v, &[token("hello"), done()]);
-        assert_eq!(v.history.get("s").map(|h| h.len()), Some(1));
+        assert_eq!(v.history.get(&sref("s")).map(|h| h.len()), Some(1));
 
         let mut a = Vec::new();
         let mut ctx = fake_ctx(&mut a);
-        apply(
+        play(
             &mut v,
             &WsServerMsg::SessionStatus {
                 session_id: "s".into(),
@@ -1177,7 +1212,7 @@ mod tests {
             &mut ctx,
         );
         assert_eq!(
-            v.history.get("s").map(|h| h.len()),
+            v.history.get(&sref("s")).map(|h| h.len()),
             Some(1),
             "completed turn must not be re-added"
         );
@@ -1191,7 +1226,7 @@ mod tests {
         run_events(&mut v, &[token("hello")]);
         let mut a = Vec::new();
         let mut ctx = fake_ctx(&mut a);
-        apply(
+        play(
             &mut v,
             &WsServerMsg::SessionStatus {
                 session_id: "s".into(),
@@ -1201,7 +1236,7 @@ mod tests {
             },
             &mut ctx,
         );
-        match &v.streaming.get("s").unwrap().blocks[0] {
+        match &v.streaming.get(&sref("s")).unwrap().blocks[0] {
             Block::Text { content } => assert_eq!(content, "hello world"),
             other => panic!("unexpected block: {other:?}"),
         }
@@ -1216,11 +1251,11 @@ mod tests {
             serde_json::from_value(serde_json::json!({ "id": "s", "is_running": true })).unwrap(),
         ];
         run_events(&mut v, &[token("partial")]);
-        assert!(v.streaming.contains_key("s"));
+        assert!(v.streaming.contains_key(&sref("s")));
 
         let mut a = Vec::new();
         let mut ctx = fake_ctx(&mut a);
-        apply(
+        play(
             &mut v,
             &WsServerMsg::SessionRunning {
                 session_id: "s".into(),
@@ -1228,9 +1263,15 @@ mod tests {
             },
             &mut ctx,
         );
-        assert!(!v.streaming.contains_key("s"), "orphaned buffer drained");
-        assert!(matches!(v.agent_status.get("s"), Some(AgentStatus::Idle)));
-        assert_eq!(v.history.get("s").map(|h| h.len()), Some(1));
+        assert!(
+            !v.streaming.contains_key(&sref("s")),
+            "orphaned buffer drained"
+        );
+        assert!(matches!(
+            v.agent_status.get(&sref("s")),
+            Some(AgentStatus::Idle)
+        ));
+        assert_eq!(v.history.get(&sref("s")).map(|h| h.len()), Some(1));
         assert!(!v.sessions[0].is_running);
     }
 }

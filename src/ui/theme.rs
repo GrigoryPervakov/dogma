@@ -2,6 +2,29 @@
 
 use ratatui::style::{Color, Modifier, Style};
 
+use crate::instance::InstanceId;
+
+/// Per-instance accent colors and sigils, used to visibly distinguish resources
+/// from different Nerve servers when more than one is connected. Indexed by
+/// `InstanceId`, wrapping if there are somehow more instances than entries.
+const INSTANCE_COLORS: [Color; 6] = [
+    Color::Cyan,
+    Color::Magenta,
+    Color::Green,
+    Color::Yellow,
+    Color::Blue,
+    Color::LightRed,
+];
+const INSTANCE_SIGILS: [char; 6] = ['●', '◆', '▲', '■', '◇', '★'];
+
+pub fn instance_color(id: InstanceId) -> Color {
+    INSTANCE_COLORS[id.index() % INSTANCE_COLORS.len()]
+}
+
+pub fn instance_sigil(id: InstanceId) -> char {
+    INSTANCE_SIGILS[id.index() % INSTANCE_SIGILS.len()]
+}
+
 pub fn accent() -> Style {
     Style::default().fg(Color::Cyan)
 }

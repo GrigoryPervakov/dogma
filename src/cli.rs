@@ -5,9 +5,11 @@ use clap::Parser;
 #[derive(Debug, Parser)]
 #[command(name = "dogma", version, about = "Terminal UI for Nerve")]
 pub struct Args {
-    /// Nerve server URL (default: http://127.0.0.1:8900).
+    /// Nerve server URL, as `url` or `name=url`. Repeat to drive several
+    /// instances at once (their resources merge into one UI, tagged per
+    /// instance). Default: http://127.0.0.1:8900.
     #[arg(long, env = "NERVE_URL")]
-    pub server: Option<String>,
+    pub server: Vec<String>,
 
     /// Open this session id directly on launch.
     #[arg(long)]

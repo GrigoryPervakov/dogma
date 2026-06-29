@@ -14,10 +14,26 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Borders, List, ListItem, ListState, Paragraph};
 
-use super::state::{ChatView, FocusTier, SessionKey, SessionRuntime, is_system_session};
+use super::state::{
+    ChatView, FocusTier, SessionKey, SessionRef, SessionRuntime, is_system_session,
+};
+use crate::app::state::InstanceMeta;
+use crate::instance::InstanceId;
 use crate::ui::{theme, truncate};
 
-pub fn render(view: &ChatView, frame: &mut Frame, area: Rect) {
+/// `<sigil> <label> ` badge for an instance, colored, label capped for the
+/// narrow sidebar. Empty when the instance isn't known.
+fn instance_badge(instances: &[InstanceMeta], id: InstanceId) -> Option<Span<'static>> {
+    instances.get(id.index()).map(|m| {
+        Span::styled(
+            format!("{} {} ", theme::instance_sigil(id), truncate(&m.label, 8)),
+            Style::default().fg(theme::instance_color(id)),
+        )
+    })
+}
+
+pub fn render(view: &ChatView, frame: &mut Frame, area: Rect, instances: &[InstanceMeta]) {
+    let multi = instances.len() > 1;
     let layout = Layout::vertical([Constraint::Length(2), Constraint::Min(0)]).split(area);
 
     let active_focus = matches!(view.focus, FocusTier::Sessions);
@@ -58,9 +74,13 @@ pub fn render(view: &ChatView, frame: &mut Frame, area: Rect) {
     let mut items: Vec<ListItem> = Vec::with_capacity(view.sessions.len() + 3);
     let mut header_indices: Vec<usize> = Vec::new(); // displayed-row indices that aren't selectable
 
-    // Logical 0 — "+ new chat".
+    // Logical 0 — "+ new chat". When several instances are connected, show the
+    // target instance's sigil (cycled with ←/→) so it's clear where it lands.
     let has_draft = view.drafts.has(&SessionKey::NewChat);
     let mut new_chat_spans: Vec<Span<'static>> = Vec::new();
+    if multi && let Some(badge) = instance_badge(instances, view.new_chat_target) {
+        new_chat_spans.push(badge);
+    }
     new_chat_spans.push(Span::styled(
         "+ new chat".to_string(),
         Style::default()
@@ -74,7 +94,13 @@ pub fn render(view: &ChatView, frame: &mut Frame, area: Rect) {
 
     // Logical 1..=user_count — user sessions.
     for s in &view.sessions[..user_count] {
-        items.push(ListItem::new(session_line(view, s, &q, active_focus)));
+        items.push(ListItem::new(session_line(
+            view,
+            s,
+            &q,
+            active_focus,
+            instances,
+        )));
     }
 
     // System group header (only if any system sessions exist).
@@ -93,7 +119,13 @@ pub fn render(view: &ChatView, frame: &mut Frame, area: Rect) {
 
         // user_count+1..= total — system sessions.
         for s in &view.sessions[user_count..] {
-            items.push(ListItem::new(session_line(view, s, &q, active_focus)));
+            items.push(ListItem::new(session_line(
+                view,
+                s,
+                &q,
+                active_focus,
+                instances,
+            )));
         }
     }
 
@@ -166,13 +198,19 @@ fn session_line(
     s: &crate::model::Session,
     q: &str,
     active_focus: bool,
+    instances: &[InstanceMeta],
 ) -> Line<'static> {
     let title_raw = s.title.clone().unwrap_or_else(|| s.id.clone());
     let dim = !q.is_empty() && !title_raw.to_lowercase().contains(q);
-    let runtime = view.session_runtime(&s.id);
+    let runtime = view.session_runtime(&SessionRef::new(s.instance, s.id.clone()));
 
-    // Leading glyph reflects runtime: streaming ●, waiting-on-poll ?, else star/blank.
+    // Leading instance badge (sigil + name) when several instances are merged.
     let mut spans: Vec<Span<'static>> = Vec::new();
+    if instances.len() > 1
+        && let Some(badge) = instance_badge(instances, s.instance)
+    {
+        spans.push(badge);
+    }
     match runtime {
         SessionRuntime::Streaming => {
             spans.push(Span::styled("●".to_string(), theme::session_streaming()));
@@ -193,7 +231,8 @@ fn session_line(
     }
     spans.push(Span::raw(" "));
 
-    let is_current = matches!(&view.current, SessionKey::Real(id) if id == &s.id);
+    let is_current =
+        matches!(&view.current, SessionKey::Real(r) if r.instance == s.instance && r.id == s.id);
     // Streaming/waiting colors take precedence; idle falls back to the
     // system/current/default hierarchy.
     let mut title_style = if dim {
@@ -215,6 +254,6 @@ fn session_line(
     if !dim && is_current && !active_focus {
         title_style = title_style.add_modifier(Modifier::BOLD);
     }
-    spans.push(Span::styled(truncate(&title_raw, 32), title_style));
+    spans.push(Span::styled(truncate(&title_raw, 40), title_style));
     Line::from(spans)
 }

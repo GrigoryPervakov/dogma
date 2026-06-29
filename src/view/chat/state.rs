@@ -10,6 +10,7 @@ use crate::ui::textarea::TextArea;
 
 use crate::api::types::{HttpReq, MessagesPayload, WsClientMsg, WsServerMsg};
 use crate::app::action::Action;
+use crate::instance::InstanceId;
 use crate::model::{Block, ContextUsage, Message, Session};
 use crate::view::chat::poll::{Poll, PollUiState};
 use crate::view::{View, ViewCtx, ViewRenderCtx};
@@ -29,15 +30,49 @@ pub enum FocusTier {
     Poll,
     /// Browsing the session's changed-files list / a file diff.
     Files,
+    /// Choosing which instance a new chat lands on (only when >1 connected).
+    NewChatPicker,
 }
 
 // ---------------------------------------------------------------------------
 // Drafts
 // ---------------------------------------------------------------------------
 
+/// A session identity qualified by the instance it lives on — ids are only
+/// unique within one Nerve server, so every map key and `current` pointer uses
+/// this rather than a bare id string.
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct SessionRef {
+    pub instance: InstanceId,
+    pub id: String,
+}
+
+impl SessionRef {
+    pub fn new(instance: InstanceId, id: impl Into<String>) -> Self {
+        Self {
+            instance,
+            id: id.into(),
+        }
+    }
+}
+
+/// A bare id refers to the primary instance — convenient for single-instance
+/// contexts and tests.
+impl From<&str> for SessionRef {
+    fn from(id: &str) -> Self {
+        SessionRef::new(InstanceId::PRIMARY, id)
+    }
+}
+
+impl From<String> for SessionRef {
+    fn from(id: String) -> Self {
+        SessionRef::new(InstanceId::PRIMARY, id)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub enum SessionKey {
-    Real(String),
+    Real(SessionRef),
     NewChat,
 }
 
@@ -266,11 +301,16 @@ pub struct ChatView {
 
     // Active session
     pub current: SessionKey,
+    /// Which instance a brand-new chat is created on (the `+ new chat` row),
+    /// chosen via the `NewChatPicker` tier when several instances are connected.
+    pub new_chat_target: InstanceId,
+    /// Cursor in the new-chat instance picker.
+    pub new_chat_pick: usize,
 
     // Chat state per session (history + streaming buffer + UI bits)
-    pub history: HashMap<String, Vec<Message>>,
-    pub streaming: HashMap<String, Message>,
-    pub agent_status: HashMap<String, AgentStatus>,
+    pub history: HashMap<SessionRef, Vec<Message>>,
+    pub streaming: HashMap<SessionRef, Message>,
+    pub agent_status: HashMap<SessionRef, AgentStatus>,
     pub ui: HashMap<SessionKey, PerSessionUi>,
 
     // Drafts per session
@@ -281,7 +321,7 @@ pub struct ChatView {
     pub side_panel: SidePanelState,
 
     // Pending interaction (one at a time, per session)
-    pub pending_interaction: HashMap<String, PendingInteraction>,
+    pub pending_interaction: HashMap<SessionRef, PendingInteraction>,
 
     // Selection state for the current session's focused poll, if any.
     pub poll_ui: Option<PollUiState>,
@@ -292,7 +332,7 @@ pub struct ChatView {
 
     // Changed files per session (from `/modified-files`, refreshed on the
     // FileChanged WS event). Browsed in the Files tier.
-    pub modified_files: HashMap<String, Vec<crate::model::ModifiedFile>>,
+    pub modified_files: HashMap<SessionRef, Vec<crate::model::ModifiedFile>>,
     pub files_selected: usize,
     pub files_loading: bool,
     /// The diff currently open in the Files tier, plus its scroll offset.
@@ -301,20 +341,20 @@ pub struct ChatView {
 
     // Wall-clock of the last WS event per session — drives the stall watchdog
     // that resyncs a session gone quiet mid-stream.
-    pub last_activity: HashMap<String, std::time::Instant>,
+    pub last_activity: HashMap<SessionRef, std::time::Instant>,
 
     // run_in_background jobs per session (from BackgroundTasksUpdate WS events).
-    pub background_tasks: HashMap<String, Vec<serde_json::Value>>,
+    pub background_tasks: HashMap<SessionRef, Vec<serde_json::Value>>,
 
     // Context usage per session
-    pub context: HashMap<String, ContextUsage>,
+    pub context: HashMap<SessionRef, ContextUsage>,
 
     // Sessions request flight
     pub sessions_loaded: bool,
     pub last_error: Option<String>,
 
     // History pagination state per session.
-    pub history_load: HashMap<String, HistoryLoadState>,
+    pub history_load: HashMap<SessionRef, HistoryLoadState>,
 }
 
 impl Default for ChatView {
@@ -335,6 +375,8 @@ impl ChatView {
             sidebar_search: String::new(),
             sidebar_search_active: false,
             current: SessionKey::NewChat,
+            new_chat_target: InstanceId::PRIMARY,
+            new_chat_pick: 0,
             history: HashMap::new(),
             streaming: HashMap::new(),
             agent_status: HashMap::new(),
@@ -361,17 +403,34 @@ impl ChatView {
 
     pub fn current_session_id(&self) -> Option<&str> {
         match &self.current {
+            SessionKey::Real(s) => Some(s.id.as_str()),
+            SessionKey::NewChat => None,
+        }
+    }
+
+    /// The full instance-qualified ref of the current session, if any.
+    pub fn current_session_ref(&self) -> Option<&SessionRef> {
+        match &self.current {
             SessionKey::Real(s) => Some(s),
             SessionKey::NewChat => None,
         }
     }
 
+    /// The instance an action on the current view targets: the current
+    /// session's instance, or the new-chat target while composing.
+    pub fn current_instance(&self) -> InstanceId {
+        match &self.current {
+            SessionKey::Real(s) => s.instance,
+            SessionKey::NewChat => self.new_chat_target,
+        }
+    }
+
     /// Coarse runtime state of a session: waiting on a poll, actively
     /// streaming, or idle.
-    pub fn session_runtime(&self, session_id: &str) -> SessionRuntime {
+    pub fn session_runtime(&self, sref: &SessionRef) -> SessionRuntime {
         match self
             .pending_interaction
-            .get(session_id)
+            .get(sref)
             .map(|p| p.interaction_type.as_str())
         {
             Some("question") => return SessionRuntime::WaitingPoll,
@@ -381,15 +440,12 @@ impl ChatView {
         let running = self
             .sessions
             .iter()
-            .find(|s| s.id == session_id)
+            .find(|s| s.instance == sref.instance && s.id == sref.id)
             .map(|s| s.is_running)
             .unwrap_or(false);
         let streaming = running
-            || self.streaming.contains_key(session_id)
-            || !matches!(
-                self.agent_status.get(session_id),
-                None | Some(AgentStatus::Idle)
-            );
+            || self.streaming.contains_key(sref)
+            || !matches!(self.agent_status.get(sref), None | Some(AgentStatus::Idle));
         if streaming {
             SessionRuntime::Streaming
         } else {
@@ -400,8 +456,8 @@ impl ChatView {
     /// Whether the currently-viewed session is actively streaming — gates the
     /// compact (collapsed + typed-header) view off and the green frame on.
     pub fn is_current_streaming(&self) -> bool {
-        self.current_session_id()
-            .map(|id| matches!(self.session_runtime(id), SessionRuntime::Streaming))
+        self.current_session_ref()
+            .map(|r| matches!(self.session_runtime(r), SessionRuntime::Streaming))
             .unwrap_or(false)
     }
 
@@ -409,17 +465,22 @@ impl ChatView {
     /// streaming but no WS event has arrived in a while, resync it with the
     /// server. Non-destructive — the `SessionStatus` reply rebuilds a running
     /// turn or heals a finished one (a lost Done leaves a chat stuck).
-    pub fn tick_watchdog(&mut self, ws_connected: bool, ctx: &mut ViewCtx) {
+    /// `connected[i]` is whether instance `i`'s WS is up.
+    pub fn tick_watchdog(&mut self, connected: &[bool], ctx: &mut ViewCtx) {
         const STALL: std::time::Duration = std::time::Duration::from_secs(60);
-        if !ws_connected || !self.is_current_streaming() {
-            return;
-        }
-        let Some(id) = self.current_session_id().map(str::to_string) else {
+        let Some(sref) = self.current_session_ref().cloned() else {
             return;
         };
+        let online = connected
+            .get(sref.instance.index())
+            .copied()
+            .unwrap_or(false);
+        if !online || !self.is_current_streaming() {
+            return;
+        }
         let stale = self
             .last_activity
-            .get(&id)
+            .get(&sref)
             .map(|t| t.elapsed() >= STALL)
             .unwrap_or(true);
         if !stale {
@@ -427,26 +488,32 @@ impl ChatView {
         }
         // Debounce — resync at most once per stall window.
         self.last_activity
-            .insert(id.clone(), std::time::Instant::now());
-        ctx.push(Action::Ws(WsClientMsg::SwitchSession {
-            session_id: id.clone(),
-        }));
-        ctx.push(Action::Http(HttpReq::GetMessages {
-            session_id: id,
-            limit: INITIAL_HISTORY_LIMIT,
-        }));
+            .insert(sref.clone(), std::time::Instant::now());
+        ctx.ws(
+            sref.instance,
+            WsClientMsg::SwitchSession {
+                session_id: sref.id.clone(),
+            },
+        );
+        ctx.http(
+            sref.instance,
+            HttpReq::GetMessages {
+                session_id: sref.id,
+                limit: INITIAL_HISTORY_LIMIT,
+            },
+        );
     }
 
     pub fn current_history(&self) -> &[Message] {
         match &self.current {
-            SessionKey::Real(id) => self.history.get(id).map(|v| v.as_slice()).unwrap_or(&[]),
+            SessionKey::Real(r) => self.history.get(r).map(|v| v.as_slice()).unwrap_or(&[]),
             SessionKey::NewChat => &[],
         }
     }
 
     pub fn current_streaming(&self) -> Option<&Message> {
         match &self.current {
-            SessionKey::Real(id) => self.streaming.get(id),
+            SessionKey::Real(r) => self.streaming.get(r),
             SessionKey::NewChat => None,
         }
     }
@@ -454,7 +521,7 @@ impl ChatView {
     pub fn current_agent_status(&self) -> &AgentStatus {
         static IDLE: AgentStatus = AgentStatus::Idle;
         match &self.current {
-            SessionKey::Real(id) => self.agent_status.get(id).unwrap_or(&IDLE),
+            SessionKey::Real(r) => self.agent_status.get(r).unwrap_or(&IDLE),
             SessionKey::NewChat => &IDLE,
         }
     }
@@ -469,14 +536,14 @@ impl ChatView {
 
     pub fn current_pending(&self) -> Option<&PendingInteraction> {
         match &self.current {
-            SessionKey::Real(id) => self.pending_interaction.get(id),
+            SessionKey::Real(r) => self.pending_interaction.get(r),
             SessionKey::NewChat => None,
         }
     }
 
     pub fn current_context(&self) -> Option<&ContextUsage> {
         match &self.current {
-            SessionKey::Real(id) => self.context.get(id),
+            SessionKey::Real(r) => self.context.get(r),
             SessionKey::NewChat => None,
         }
     }
@@ -485,10 +552,10 @@ impl ChatView {
     /// list). Returns 0.0 if unknown.
     pub fn current_cost_usd(&self) -> f64 {
         match &self.current {
-            SessionKey::Real(id) => self
+            SessionKey::Real(r) => self
                 .sessions
                 .iter()
-                .find(|s| &s.id == id)
+                .find(|s| s.instance == r.instance && s.id == r.id)
                 .map(|s| s.total_cost_usd)
                 .unwrap_or(0.0),
             SessionKey::NewChat => 0.0,
@@ -513,7 +580,7 @@ impl ChatView {
     fn key_at(&self, idx: usize) -> SessionKey {
         match self.session_at(idx) {
             None => SessionKey::NewChat,
-            Some(s) => SessionKey::Real(s.id.clone()),
+            Some(s) => SessionKey::Real(SessionRef::new(s.instance, s.id.clone())),
         }
     }
 
@@ -568,34 +635,46 @@ impl ChatView {
                 self.focus = FocusTier::Insert;
             }
             ChatCommand::Fork(title) => {
-                if let Some(id) = self.current_session_id().map(str::to_string) {
-                    out.push(Action::Ws(WsClientMsg::Fork {
-                        session_id: id,
-                        at_message_id: None,
-                        title,
-                    }));
+                if let Some(sref) = self.current_session_ref().cloned() {
+                    out.push(Action::Ws {
+                        instance: sref.instance,
+                        msg: WsClientMsg::Fork {
+                            session_id: sref.id,
+                            at_message_id: None,
+                            title,
+                        },
+                    });
                 }
             }
             ChatCommand::Resume => {
-                if let Some(id) = self.current_session_id().map(str::to_string) {
-                    out.push(Action::Ws(WsClientMsg::Resume { session_id: id }));
+                if let Some(sref) = self.current_session_ref().cloned() {
+                    out.push(Action::Ws {
+                        instance: sref.instance,
+                        msg: WsClientMsg::Resume {
+                            session_id: sref.id,
+                        },
+                    });
                 }
             }
             ChatCommand::Rename(_) => { /* TODO PATCH /api/sessions/{id} */ }
             ChatCommand::Delete => { /* TODO DELETE /api/sessions/{id} */ }
             ChatCommand::Reload => {
-                if let Some(id) = self.current_session_id().map(str::to_string) {
+                if let Some(sref) = self.current_session_ref().cloned() {
                     // Drop every local cache for this session — an orphaned
                     // streaming buffer or a non-Idle agent_status (from a lost
                     // Done/Stopped) is exactly what gets a chat "stuck".
-                    self.streaming.remove(&id);
-                    self.agent_status.insert(id.clone(), AgentStatus::Idle);
-                    self.history.remove(&id);
-                    self.history_load.remove(&id);
-                    self.pending_interaction.remove(&id);
-                    self.modified_files.remove(&id);
+                    self.streaming.remove(&sref);
+                    self.agent_status.insert(sref.clone(), AgentStatus::Idle);
+                    self.history.remove(&sref);
+                    self.history_load.remove(&sref);
+                    self.pending_interaction.remove(&sref);
+                    self.modified_files.remove(&sref);
                     self.open_diff = None;
-                    if let Some(s) = self.sessions.iter_mut().find(|s| s.id == id) {
+                    if let Some(s) = self
+                        .sessions
+                        .iter_mut()
+                        .find(|s| s.instance == sref.instance && s.id == sref.id)
+                    {
                         s.is_running = false;
                     }
                     self.poll_ui = None;
@@ -603,14 +682,20 @@ impl ChatView {
                         self.focus = FocusTier::ChatBlocks;
                     }
                     // Re-route events and refetch canonical history.
-                    out.push(Action::Ws(WsClientMsg::SwitchSession {
-                        session_id: id.clone(),
-                    }));
-                    out.push(Action::Http(HttpReq::GetMessages {
-                        session_id: id.clone(),
-                        limit: INITIAL_HISTORY_LIMIT,
-                    }));
-                    let entry = self.history_load.entry(id).or_default();
+                    out.push(Action::Ws {
+                        instance: sref.instance,
+                        msg: WsClientMsg::SwitchSession {
+                            session_id: sref.id.clone(),
+                        },
+                    });
+                    out.push(Action::Http {
+                        instance: sref.instance,
+                        req: HttpReq::GetMessages {
+                            session_id: sref.id.clone(),
+                            limit: INITIAL_HISTORY_LIMIT,
+                        },
+                    });
+                    let entry = self.history_load.entry(sref).or_default();
                     entry.limit = INITIAL_HISTORY_LIMIT;
                     entry.loading = true;
                     entry.exhausted = false;
@@ -624,20 +709,32 @@ impl ChatView {
 
     pub fn apply_sessions_loaded(
         &mut self,
+        instance: InstanceId,
         result: std::result::Result<Vec<Session>, String>,
         _ctx: &mut ViewCtx,
     ) {
         match result {
-            Ok(list) => {
-                // Partition: user-source sessions first, system-source
-                // (cron / hook) below. Stable within each group preserves
-                // the server's updated_at-DESC order. Mirrors
+            Ok(mut list) => {
+                // Stamp the origin instance, then merge: replace this instance's
+                // rows, keep the others. User-source sessions sort above
+                // system-source (cron / hook); each group most-recent-first
+                // across all instances. Mirrors
                 // web/src/components/Chat/SessionSidebar.tsx.
-                let (user, system): (Vec<_>, Vec<_>) =
-                    list.into_iter().partition(|s| !is_system_session(s));
-                let mut combined = user;
-                combined.extend(system);
-                self.sessions = combined;
+                for s in &mut list {
+                    s.instance = instance;
+                }
+                self.sessions.retain(|s| s.instance != instance);
+                self.sessions.append(&mut list);
+                self.sessions.sort_by(|a, b| {
+                    is_system_session(a)
+                        .cmp(&is_system_session(b))
+                        .then_with(|| {
+                            b.updated_at
+                                .as_deref()
+                                .unwrap_or("")
+                                .cmp(a.updated_at.as_deref().unwrap_or(""))
+                        })
+                });
                 self.sessions_loaded = true;
                 self.last_error = None;
             }
@@ -657,8 +754,12 @@ impl ChatView {
     /// the web. Called when a message is sent, so the chat you just wrote to
     /// jumps to the top (the next `ListSessions` agrees, since the server bumps
     /// `updated_at`). System/cron sessions keep their own group ordering.
-    fn bump_session_to_front(&mut self, id: &str) {
-        let Some(pos) = self.sessions.iter().position(|s| s.id == id) else {
+    fn bump_session_to_front(&mut self, sref: &SessionRef) {
+        let Some(pos) = self
+            .sessions
+            .iter()
+            .position(|s| s.instance == sref.instance && s.id == sref.id)
+        else {
             return;
         };
         if is_system_session(&self.sessions[pos]) {
@@ -674,11 +775,13 @@ impl ChatView {
 
     pub fn apply_messages_loaded(
         &mut self,
+        instance: InstanceId,
         session_id: &str,
         limit: u32,
         result: std::result::Result<MessagesPayload, String>,
         _ctx: &mut ViewCtx,
     ) {
+        let sref = SessionRef::new(instance, session_id);
         match result {
             Ok(payload) => {
                 let MessagesPayload {
@@ -688,17 +791,17 @@ impl ChatView {
                 let new_len = messages.len();
                 let old_items: usize = self
                     .history
-                    .get(session_id)
+                    .get(&sref)
                     .map(|h| h.iter().map(|m| m.blocks.len()).sum::<usize>())
                     .unwrap_or(0);
                 let new_items: usize = messages.iter().map(|m| m.blocks.len()).sum();
                 let is_initial_load = old_items == 0;
 
-                self.history.insert(session_id.to_string(), messages);
-                let key = SessionKey::Real(session_id.to_string());
+                self.history.insert(sref.clone(), messages);
+                let key = SessionKey::Real(sref.clone());
 
                 // History-load bookkeeping.
-                let entry = self.history_load.entry(session_id.to_string()).or_default();
+                let entry = self.history_load.entry(sref.clone()).or_default();
                 entry.limit = limit;
                 entry.loading = false;
                 // Server returned < limit → we've got everything.
@@ -707,7 +810,7 @@ impl ChatView {
                 // Wire context usage from the messages-endpoint response.
                 // last_usage nests max_context_tokens + num_turns inside the
                 // Usage object (vs. WS Done where they're top-level).
-                let ctx_entry = self.context.entry(session_id.to_string()).or_default();
+                let ctx_entry = self.context.entry(sref.clone()).or_default();
                 if let Some(u) = last_usage {
                     if let Some(m) = u.max_context_tokens {
                         ctx_entry.max_context_tokens = Some(m);
@@ -745,7 +848,7 @@ impl ChatView {
                 self.last_error = None;
             }
             Err(e) => {
-                if let Some(s) = self.history_load.get_mut(session_id) {
+                if let Some(s) = self.history_load.get_mut(&sref) {
                     s.loading = false;
                 }
                 self.last_error = Some(format!("history({session_id}): {e}"));
@@ -754,8 +857,8 @@ impl ChatView {
     }
 
     /// Returns true if there might be more older messages on the server.
-    pub fn can_load_more(&self, session_id: &str) -> bool {
-        match self.history_load.get(session_id) {
+    pub fn can_load_more(&self, sref: &SessionRef) -> bool {
+        match self.history_load.get(sref) {
             Some(s) => !s.exhausted && !s.loading,
             // No load record yet → we haven't loaded anything; assume yes.
             None => true,
@@ -765,11 +868,7 @@ impl ChatView {
     /// True while a history fetch is in flight for the current session.
     pub fn is_loading_history(&self) -> bool {
         match &self.current {
-            SessionKey::Real(id) => self
-                .history_load
-                .get(id)
-                .map(|s| s.loading)
-                .unwrap_or(false),
+            SessionKey::Real(r) => self.history_load.get(r).map(|s| s.loading).unwrap_or(false),
             SessionKey::NewChat => false,
         }
     }
@@ -800,27 +899,22 @@ impl ChatView {
             let prev_top = ui.viewport_top.min(total - 1);
             let follow_tail = ui.follow_tail;
 
-            let id_for_hint = match &key {
-                SessionKey::Real(id) => Some(id.clone()),
+            let ref_for_hint = match &key {
+                SessionKey::Real(r) => Some(r.clone()),
                 SessionKey::NewChat => None,
             };
-            let can_load = id_for_hint
-                .as_deref()
-                .map(|id| {
+            let can_load = ref_for_hint
+                .as_ref()
+                .map(|r| {
                     self.history_load
-                        .get(id)
+                        .get(r)
                         .map(|s| !s.exhausted && !s.loading)
                         .unwrap_or(true)
                 })
                 .unwrap_or(false);
-            let loading = id_for_hint
-                .as_deref()
-                .map(|id| {
-                    self.history_load
-                        .get(id)
-                        .map(|s| s.loading)
-                        .unwrap_or(false)
-                })
+            let loading = ref_for_hint
+                .as_ref()
+                .map(|r| self.history_load.get(r).map(|s| s.loading).unwrap_or(false))
                 .unwrap_or(false);
 
             if follow_tail {
@@ -843,41 +937,49 @@ impl ChatView {
 
     pub fn apply_session_created(
         &mut self,
+        instance: InstanceId,
         pending_content: Option<String>,
         result: std::result::Result<Session, String>,
         ctx: &mut ViewCtx,
     ) {
         match result {
-            Ok(session) => {
-                let id = session.id.clone();
+            Ok(mut session) => {
+                session.instance = instance;
+                let sref = SessionRef::new(instance, session.id.clone());
                 // Insert at top of live group.
                 self.sessions.insert(0, session);
                 // Switch active session.
-                self.current = SessionKey::Real(id.clone());
+                self.current = SessionKey::Real(sref.clone());
                 self.drafts.clear(&SessionKey::NewChat);
                 // Sidebar selection now points to the new session (idx 1).
                 self.sessions_selected = 1;
                 // SwitchSession over WS.
-                ctx.push(Action::Ws(WsClientMsg::SwitchSession {
-                    session_id: id.clone(),
-                }));
+                ctx.ws(
+                    instance,
+                    WsClientMsg::SwitchSession {
+                        session_id: sref.id.clone(),
+                    },
+                );
                 // Send pending content as the first message.
                 if let Some(content) = pending_content
                     && !content.is_empty()
                 {
-                    ctx.push(Action::Ws(WsClientMsg::Message {
-                        session_id: id.clone(),
-                        content: content.clone(),
-                        file_ids: None,
-                    }));
+                    ctx.ws(
+                        instance,
+                        WsClientMsg::Message {
+                            session_id: sref.id.clone(),
+                            content: content.clone(),
+                            file_ids: None,
+                        },
+                    );
                     // Optimistically append the user message to history.
                     self.history
-                        .entry(id.clone())
+                        .entry(sref.clone())
                         .or_default()
-                        .push(Message::new_user(id.clone(), content));
+                        .push(Message::new_user(sref.id.clone(), content));
                     // Follow-tail engaged.
-                    let key = SessionKey::Real(id.clone());
-                    let last_idx = self.items_count_for(&id).saturating_sub(1);
+                    let key = SessionKey::Real(sref.clone());
+                    let last_idx = self.items_count_for(&sref).saturating_sub(1);
                     let ui = self.ui_mut(&key);
                     ui.follow_tail = true;
                     ui.selected_block = Some(last_idx);
@@ -904,8 +1006,8 @@ impl ChatView {
 
     // ----- WS streaming reducer --------------------------------------------
 
-    pub fn apply_wire(&mut self, msg: &WsServerMsg, ctx: &mut ViewCtx) {
-        super::reducer::apply(self, msg, ctx);
+    pub fn apply_wire(&mut self, instance: InstanceId, msg: &WsServerMsg, ctx: &mut ViewCtx) {
+        super::reducer::apply(self, instance, msg, ctx);
     }
 }
 
@@ -918,8 +1020,8 @@ impl ChatView {
         self.sessions_selected = idx;
         let key = self.key_at(idx);
         self.switch_to(key.clone());
-        if let SessionKey::Real(id) = &key {
-            self.ensure_history_fetch(id, ctx);
+        if let SessionKey::Real(sref) = &key {
+            self.ensure_history_fetch(sref, ctx);
         }
     }
 
@@ -931,11 +1033,14 @@ impl ChatView {
         self.switch_to(key.clone());
 
         match &key {
-            SessionKey::Real(id) => {
-                ctx.push(Action::Ws(WsClientMsg::SwitchSession {
-                    session_id: id.clone(),
-                }));
-                self.ensure_history_fetch(id, ctx);
+            SessionKey::Real(sref) => {
+                ctx.ws(
+                    sref.instance,
+                    WsClientMsg::SwitchSession {
+                        session_id: sref.id.clone(),
+                    },
+                );
+                self.ensure_history_fetch(sref, ctx);
                 // Land on the input box, ready to type — unless the agent is
                 // mid-stream (input is hidden) in which case browse the blocks.
                 // A pending poll/plan overrides below.
@@ -946,24 +1051,65 @@ impl ChatView {
                 };
                 // Cached session: jump to the latest unless the user is pinned
                 // up-thread. (Uncached: handled on history load.)
-                self.scroll_to_latest_unless_pinned(id);
+                self.scroll_to_latest_unless_pinned(sref);
                 self.focus_interaction_if_pending();
             }
             SessionKey::NewChat => {
-                self.focus = FocusTier::Insert;
+                if ctx.instances.len() > 1 {
+                    self.show_new_chat_picker(ctx.instances);
+                } else {
+                    self.focus = FocusTier::Insert;
+                }
             }
         }
     }
 
-    fn ensure_history_fetch(&mut self, id: &str, ctx: &mut ViewCtx) {
-        if self.history.contains_key(id) {
+    /// Open the instance picker for a new chat, with the cursor on the current
+    /// target. Caller guarantees more than one instance is connected.
+    pub fn show_new_chat_picker(&mut self, instances: &[InstanceId]) {
+        self.new_chat_pick = instances
+            .iter()
+            .position(|&i| i == self.new_chat_target)
+            .unwrap_or(0);
+        self.focus = FocusTier::NewChatPicker;
+    }
+
+    fn keys_new_chat_picker(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
+        let n = ctx.instances.len();
+        match key.code {
+            KeyCode::Up | KeyCode::Char('k') => {
+                self.new_chat_pick = self.new_chat_pick.saturating_sub(1);
+            }
+            KeyCode::Down | KeyCode::Char('j') => {
+                if self.new_chat_pick + 1 < n {
+                    self.new_chat_pick += 1;
+                }
+            }
+            KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
+                if let Some(&id) = ctx.instances.get(self.new_chat_pick) {
+                    self.new_chat_target = id;
+                }
+                self.focus = FocusTier::Insert;
+            }
+            KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
+                self.focus = FocusTier::Sessions;
+            }
+            _ => {}
+        }
+    }
+
+    fn ensure_history_fetch(&mut self, sref: &SessionRef, ctx: &mut ViewCtx) {
+        if self.history.contains_key(sref) {
             return;
         }
-        ctx.push(Action::Http(HttpReq::GetMessages {
-            session_id: id.to_string(),
-            limit: INITIAL_HISTORY_LIMIT,
-        }));
-        let entry = self.history_load.entry(id.to_string()).or_default();
+        ctx.http(
+            sref.instance,
+            HttpReq::GetMessages {
+                session_id: sref.id.clone(),
+                limit: INITIAL_HISTORY_LIMIT,
+            },
+        );
+        let entry = self.history_load.entry(sref.clone()).or_default();
         entry.limit = INITIAL_HISTORY_LIMIT;
         entry.loading = true;
         entry.exhausted = false;
@@ -1001,8 +1147,8 @@ impl ChatView {
 
     /// run_in_background jobs for the active session.
     pub fn current_background(&self) -> &[serde_json::Value] {
-        self.current_session_id()
-            .and_then(|id| self.background_tasks.get(id))
+        self.current_session_ref()
+            .and_then(|r| self.background_tasks.get(r))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
@@ -1010,8 +1156,8 @@ impl ChatView {
     /// The poll the user can answer right now: a pending `question`
     /// interaction for the current session whose id matches `poll_ui`.
     pub fn active_poll(&self) -> Option<&PollUiState> {
-        let sid = self.current_session_id()?;
-        let pending = self.pending_interaction.get(sid)?;
+        let sref = self.current_session_ref()?;
+        let pending = self.pending_interaction.get(sref)?;
         let ui = self.poll_ui.as_ref()?;
         (pending.interaction_type == "question" && pending.interaction_id == ui.interaction_id)
             .then_some(ui)
@@ -1023,8 +1169,8 @@ impl ChatView {
     /// it (live arrival / explicit enter) or leave it (sidebar preview).
     pub fn sync_poll(&mut self) {
         let pending = self
-            .current_session_id()
-            .and_then(|sid| self.pending_interaction.get(sid))
+            .current_session_ref()
+            .and_then(|sref| self.pending_interaction.get(sref))
             .filter(|p| p.interaction_type == "question")
             .cloned()
             .filter(|p| !self.answered_interactions.contains(&p.interaction_id));
@@ -1061,8 +1207,8 @@ impl ChatView {
     /// The pending `EnterPlanMode`/`ExitPlanMode` interaction the user can
     /// approve right now for the current session, if any.
     pub fn active_plan(&self) -> Option<&PendingInteraction> {
-        let sid = self.current_session_id()?;
-        let p = self.pending_interaction.get(sid)?;
+        let sref = self.current_session_ref()?;
+        let p = self.pending_interaction.get(sref)?;
         (matches!(p.interaction_type.as_str(), "plan_enter" | "plan_exit")
             && !self.answered_interactions.contains(&p.interaction_id))
         .then_some(p)
@@ -1073,19 +1219,22 @@ impl ChatView {
         let Some(p) = self.active_plan() else {
             return;
         };
-        let Some(sid) = self.current_session_id().map(str::to_string) else {
+        let Some(sref) = self.current_session_ref().cloned() else {
             return;
         };
         let interaction_id = p.interaction_id.clone();
         self.answered_interactions.insert(interaction_id.clone());
-        ctx.push(Action::Ws(WsClientMsg::AnswerInteraction {
-            session_id: sid.clone(),
-            interaction_id,
-            result: None,
-            denied: !approved,
-            message: (!approved).then(|| "User declined.".to_string()),
-        }));
-        self.pending_interaction.remove(&sid);
+        ctx.ws(
+            sref.instance,
+            WsClientMsg::AnswerInteraction {
+                session_id: sref.id.clone(),
+                interaction_id,
+                result: None,
+                denied: !approved,
+                message: (!approved).then(|| "User declined.".to_string()),
+            },
+        );
+        self.pending_interaction.remove(&sref);
         self.jump_last();
     }
 
@@ -1093,15 +1242,15 @@ impl ChatView {
 
     /// The current session's changed-files list.
     pub fn current_modified_files(&self) -> &[crate::model::ModifiedFile] {
-        self.current_session_id()
-            .and_then(|id| self.modified_files.get(id))
+        self.current_session_ref()
+            .and_then(|r| self.modified_files.get(r))
             .map(Vec::as_slice)
             .unwrap_or(&[])
     }
 
     /// Open the Files tier and (re)fetch the changed-files list.
     fn open_files_panel(&mut self, ctx: &mut ViewCtx) {
-        let Some(id) = self.current_session_id().map(str::to_string) else {
+        let Some(sref) = self.current_session_ref().cloned() else {
             return;
         };
         self.focus = FocusTier::Files;
@@ -1111,21 +1260,30 @@ impl ChatView {
             .files_selected
             .min(self.current_modified_files().len().saturating_sub(1));
         self.files_loading = true;
-        ctx.push(Action::Http(HttpReq::GetModifiedFiles { session_id: id }));
+        ctx.http(
+            sref.instance,
+            HttpReq::GetModifiedFiles {
+                session_id: sref.id,
+            },
+        );
     }
 
     /// Refresh the changed-files list for a session if it's already tracked —
     /// used to react to FileChanged events without grabbing focus.
-    pub fn refresh_modified_files(&mut self, session_id: &str, ctx: &mut ViewCtx) {
-        if self.modified_files.contains_key(session_id) {
-            ctx.push(Action::Http(HttpReq::GetModifiedFiles {
-                session_id: session_id.to_string(),
-            }));
+    pub fn refresh_modified_files(&mut self, sref: &SessionRef, ctx: &mut ViewCtx) {
+        if self.modified_files.contains_key(sref) {
+            ctx.http(
+                sref.instance,
+                HttpReq::GetModifiedFiles {
+                    session_id: sref.id.clone(),
+                },
+            );
         }
     }
 
     pub fn apply_modified_files(
         &mut self,
+        instance: InstanceId,
         session_id: &str,
         result: std::result::Result<Vec<crate::model::ModifiedFile>, String>,
     ) {
@@ -1133,7 +1291,8 @@ impl ChatView {
         match result {
             Ok(files) => {
                 self.files_selected = self.files_selected.min(files.len().saturating_sub(1));
-                self.modified_files.insert(session_id.to_string(), files);
+                self.modified_files
+                    .insert(SessionRef::new(instance, session_id), files);
             }
             Err(e) => self.last_error = Some(format!("modified-files: {e}")),
         }
@@ -1141,6 +1300,8 @@ impl ChatView {
 
     pub fn apply_file_diff(
         &mut self,
+        _instance: InstanceId,
+        _session_id: &str,
         _path: &str,
         result: std::result::Result<crate::model::FileDiff, String>,
     ) {
@@ -1193,21 +1354,22 @@ impl ChatView {
                     .current_modified_files()
                     .get(self.files_selected)
                     .map(|f| f.path.clone());
-                if let (Some(path), Some(id)) =
-                    (target, self.current_session_id().map(str::to_string))
-                {
-                    ctx.push(Action::Http(HttpReq::GetFileDiff {
-                        session_id: id,
-                        path,
-                    }));
+                if let (Some(path), Some(sref)) = (target, self.current_session_ref().cloned()) {
+                    ctx.http(
+                        sref.instance,
+                        HttpReq::GetFileDiff {
+                            session_id: sref.id,
+                            path,
+                        },
+                    );
                 }
             }
             _ => {}
         }
     }
 
-    fn clear_poll(&mut self, session_id: &str) {
-        self.pending_interaction.remove(session_id);
+    fn clear_poll(&mut self, sref: &SessionRef) {
+        self.pending_interaction.remove(sref);
         self.poll_ui = None;
         self.focus = FocusTier::ChatBlocks;
         self.jump_last();
@@ -1217,39 +1379,45 @@ impl ChatView {
         let Some(ui) = self.poll_ui.as_ref() else {
             return;
         };
-        let Some(sid) = self.current_session_id().map(str::to_string) else {
+        let Some(sref) = self.current_session_ref().cloned() else {
             return;
         };
         let interaction_id = ui.interaction_id.clone();
         let result = ui.build_answers();
         self.answered_interactions.insert(interaction_id.clone());
-        ctx.push(Action::Ws(WsClientMsg::AnswerInteraction {
-            session_id: sid.clone(),
-            interaction_id,
-            result: Some(result),
-            denied: false,
-            message: None,
-        }));
-        self.clear_poll(&sid);
+        ctx.ws(
+            sref.instance,
+            WsClientMsg::AnswerInteraction {
+                session_id: sref.id.clone(),
+                interaction_id,
+                result: Some(result),
+                denied: false,
+                message: None,
+            },
+        );
+        self.clear_poll(&sref);
     }
 
     fn deny_poll(&mut self, ctx: &mut ViewCtx) {
         let Some(ui) = self.poll_ui.as_ref() else {
             return;
         };
-        let Some(sid) = self.current_session_id().map(str::to_string) else {
+        let Some(sref) = self.current_session_ref().cloned() else {
             return;
         };
         let interaction_id = ui.interaction_id.clone();
         self.answered_interactions.insert(interaction_id.clone());
-        ctx.push(Action::Ws(WsClientMsg::AnswerInteraction {
-            session_id: sid.clone(),
-            interaction_id,
-            result: None,
-            denied: true,
-            message: Some("Skipped by user.".into()),
-        }));
-        self.clear_poll(&sid);
+        ctx.ws(
+            sref.instance,
+            WsClientMsg::AnswerInteraction {
+                session_id: sref.id.clone(),
+                interaction_id,
+                result: None,
+                denied: true,
+                message: Some("Skipped by user.".into()),
+            },
+        );
+        self.clear_poll(&sref);
     }
 
     fn keys_poll(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
@@ -1304,16 +1472,16 @@ impl ChatView {
         super::items::count(self.current_history(), self.current_streaming())
     }
 
-    /// Total chat items (per-block count) for a given session id.
-    fn items_count_for(&self, session_id: &str) -> usize {
+    /// Total chat items (per-block count) for a given session.
+    fn items_count_for(&self, sref: &SessionRef) -> usize {
         let h_count = self
             .history
-            .get(session_id)
+            .get(sref)
             .map(|h| h.iter().map(|m| m.blocks.len()).sum::<usize>())
             .unwrap_or(0);
         let s_count = self
             .streaming
-            .get(session_id)
+            .get(sref)
             .map(|m| m.blocks.len())
             .unwrap_or(0);
         h_count + s_count
@@ -1358,14 +1526,14 @@ impl ChatView {
 
     /// Trigger a load-older fetch for the current session, if applicable.
     fn try_load_older(&mut self, ctx: &mut ViewCtx) {
-        let id = match self.current_session_id() {
-            Some(s) => s.to_string(),
+        let sref = match self.current_session_ref() {
+            Some(s) => s.clone(),
             None => return,
         };
-        if !self.can_load_more(&id) {
+        if !self.can_load_more(&sref) {
             return;
         }
-        let entry = self.history_load.entry(id.clone()).or_default();
+        let entry = self.history_load.entry(sref.clone()).or_default();
         let next_limit = if entry.limit == 0 {
             INITIAL_HISTORY_LIMIT
         } else {
@@ -1373,10 +1541,13 @@ impl ChatView {
         };
         entry.limit = next_limit;
         entry.loading = true;
-        ctx.push(Action::Http(HttpReq::GetMessages {
-            session_id: id,
-            limit: next_limit,
-        }));
+        ctx.http(
+            sref.instance,
+            HttpReq::GetMessages {
+                session_id: sref.id,
+                limit: next_limit,
+            },
+        );
     }
 
     fn jump_first(&mut self) {
@@ -1399,12 +1570,12 @@ impl ChatView {
     /// had scrolled up (`!follow_tail`) and no blocks have arrived since
     /// (`total <= seen_block_count`), in which case their position is kept.
     /// A no-op until history loads (`apply_messages_loaded` handles first load).
-    fn scroll_to_latest_unless_pinned(&mut self, id: &str) {
-        let total = self.items_count_for(id);
+    fn scroll_to_latest_unless_pinned(&mut self, sref: &SessionRef) {
+        let total = self.items_count_for(sref);
         if total == 0 {
             return;
         }
-        let key = SessionKey::Real(id.to_string());
+        let key = SessionKey::Real(sref.clone());
         let ui = self.ui_mut(&key);
         let pinned = !ui.follow_tail && total <= ui.seen_block_count;
         if pinned {
@@ -1423,24 +1594,27 @@ impl ChatView {
             return;
         }
         match self.current.clone() {
-            SessionKey::Real(id) => {
-                ctx.push(Action::Ws(WsClientMsg::Message {
-                    session_id: id.clone(),
-                    content: content.clone(),
-                    file_ids: None,
-                }));
+            SessionKey::Real(sref) => {
+                ctx.ws(
+                    sref.instance,
+                    WsClientMsg::Message {
+                        session_id: sref.id.clone(),
+                        content: content.clone(),
+                        file_ids: None,
+                    },
+                );
                 // Optimistic local append.
                 self.history
-                    .entry(id.clone())
+                    .entry(sref.clone())
                     .or_default()
-                    .push(Message::new_user(id.clone(), content));
-                let key = SessionKey::Real(id.clone());
-                let last_idx = self.history[&id].len().saturating_sub(1);
+                    .push(Message::new_user(sref.id.clone(), content));
+                let key = SessionKey::Real(sref.clone());
+                let last_idx = self.history[&sref].len().saturating_sub(1);
                 let ui = self.ui_mut(&key);
                 ui.follow_tail = true;
                 ui.selected_block = Some(last_idx);
                 // Float this chat to the top of the sidebar, as in the web.
-                self.bump_session_to_front(&id);
+                self.bump_session_to_front(&sref);
                 self.drafts.clear(&self.current);
                 self.input = TextArea::default();
                 self.input
@@ -1448,13 +1622,17 @@ impl ChatView {
                 self.focus = FocusTier::ChatBlocks;
             }
             SessionKey::NewChat => {
-                // Lazy POST: create the session, carrying the typed message so
-                // it's sent as the first turn once the id comes back. Clear the
-                // input now; `apply_session_created` restores it if the POST fails.
-                ctx.push(Action::Http(HttpReq::CreateSession {
-                    title: None,
-                    content: Some(content),
-                }));
+                // Lazy POST: create the session on the new-chat target instance,
+                // carrying the typed message so it's sent as the first turn once
+                // the id comes back. Clear the input now; `apply_session_created`
+                // restores it if the POST fails.
+                ctx.http(
+                    self.new_chat_target,
+                    HttpReq::CreateSession {
+                        title: None,
+                        content: Some(content),
+                    },
+                );
                 self.drafts.clear(&SessionKey::NewChat);
                 self.input = TextArea::default();
                 self.input
@@ -1499,7 +1677,7 @@ impl View for ChatView {
         // typing (see `keys_input_focused`).
         matches!(
             self.focus,
-            FocusTier::Insert | FocusTier::Poll | FocusTier::Files
+            FocusTier::Insert | FocusTier::Poll | FocusTier::Files | FocusTier::NewChatPicker
         )
     }
 
@@ -1512,6 +1690,7 @@ impl View for ChatView {
             FocusTier::Insert => self.keys_insert(key, ctx),
             FocusTier::Poll => self.keys_poll(key, ctx),
             FocusTier::Files => self.keys_files(key, ctx),
+            FocusTier::NewChatPicker => self.keys_new_chat_picker(key, ctx),
         }
     }
 
@@ -1755,6 +1934,13 @@ impl ChatView {
 mod tests {
     use super::*;
 
+    const TEST_IDS: [InstanceId; 1] = [InstanceId::PRIMARY];
+
+    /// Primary-instance session ref from a bare id.
+    fn sref(id: &str) -> SessionRef {
+        SessionRef::from(id)
+    }
+
     fn assistant_with_blocks(session_id: &str, n: usize) -> Message {
         let mut m = Message::new_streaming_assistant(session_id.to_string());
         m.blocks = (0..n)
@@ -1778,7 +1964,7 @@ mod tests {
             ui.seen_block_count = 3;
             ui.selected_block = Some(0);
         }
-        v.scroll_to_latest_unless_pinned("s1");
+        v.scroll_to_latest_unless_pinned(&sref("s1"));
         let ui = &v.ui[&key];
         assert_eq!(ui.selected_block, Some(0));
         assert!(!ui.follow_tail);
@@ -1797,7 +1983,7 @@ mod tests {
             ui.seen_block_count = 3;
             ui.selected_block = Some(0);
         }
-        v.scroll_to_latest_unless_pinned("s1");
+        v.scroll_to_latest_unless_pinned(&sref("s1"));
         let ui = &v.ui[&key];
         assert_eq!(ui.selected_block, Some(3));
         assert!(ui.follow_tail);
@@ -1817,7 +2003,7 @@ mod tests {
             ui.seen_block_count = 3;
             ui.selected_block = Some(2);
         }
-        v.scroll_to_latest_unless_pinned("s1");
+        v.scroll_to_latest_unless_pinned(&sref("s1"));
         let ui = &v.ui[&key];
         assert_eq!(ui.selected_block, Some(2));
         assert!(ui.follow_tail);
@@ -1826,6 +2012,7 @@ mod tests {
     fn ctx(actions: &mut Vec<Action>) -> ViewCtx<'_> {
         ViewCtx {
             app_actions: actions,
+            instances: &TEST_IDS,
         }
     }
 
@@ -1902,7 +2089,10 @@ mod tests {
         );
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Ws(WsClientMsg::AnswerInteraction { denied: false, .. })
+            Action::Ws {
+                msg: WsClientMsg::AnswerInteraction { denied: false, .. },
+                ..
+            }
         )));
         assert!(v.active_plan().is_none());
     }
@@ -1919,11 +2109,14 @@ mod tests {
         );
         assert!(actions.iter().any(|a| matches!(
             a,
-            Action::Ws(WsClientMsg::AnswerInteraction {
-                denied: true,
-                message: Some(_),
+            Action::Ws {
+                msg: WsClientMsg::AnswerInteraction {
+                    denied: true,
+                    message: Some(_),
+                    ..
+                },
                 ..
-            })
+            }
         )));
         assert!(v.active_plan().is_none());
     }
@@ -1933,7 +2126,7 @@ mod tests {
     fn pending_plan_marks_session_waiting_plan() {
         let mut v = ChatView::new();
         plan_pending(&mut v, "plan_exit");
-        assert_eq!(v.session_runtime("s1"), SessionRuntime::WaitingPlan);
+        assert_eq!(v.session_runtime(&sref("s1")), SessionRuntime::WaitingPlan);
     }
 
     /// Navigating (j/k) while a plan is pending does NOT answer it — the user
@@ -1948,9 +2141,13 @@ mod tests {
             &mut ctx(&mut actions),
         );
         assert!(
-            !actions
-                .iter()
-                .any(|a| matches!(a, Action::Ws(WsClientMsg::AnswerInteraction { .. }))),
+            !actions.iter().any(|a| matches!(
+                a,
+                Action::Ws {
+                    msg: WsClientMsg::AnswerInteraction { .. },
+                    ..
+                }
+            )),
             "navigation must not answer the plan"
         );
         assert!(v.active_plan().is_some(), "plan still pending");
@@ -2051,20 +2248,33 @@ mod tests {
 
         let actions = v.run_command(ChatCommand::Reload);
 
-        assert!(!v.streaming.contains_key("s1"), "streaming buffer cleared");
-        assert!(matches!(v.agent_status.get("s1"), Some(AgentStatus::Idle)));
-        assert!(!v.history.contains_key("s1"), "history cleared for refetch");
+        assert!(
+            !v.streaming.contains_key(&sref("s1")),
+            "streaming buffer cleared"
+        );
+        assert!(matches!(
+            v.agent_status.get(&sref("s1")),
+            Some(AgentStatus::Idle)
+        ));
+        assert!(
+            !v.history.contains_key(&sref("s1")),
+            "history cleared for refetch"
+        );
         assert!(!v.sessions[0].is_running, "is_running reset");
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::Ws(WsClientMsg::SwitchSession { .. })))
-        );
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::Http(HttpReq::GetMessages { .. })))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Ws {
+                msg: WsClientMsg::SwitchSession { .. },
+                ..
+            }
+        )));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Http {
+                req: HttpReq::GetMessages { .. },
+                ..
+            }
+        )));
     }
 
     /// Sending a message floats that chat to the top of the sidebar list.
@@ -2084,10 +2294,74 @@ mod tests {
 
         assert_eq!(v.sessions[0].id, "c", "messaged chat floats to the top");
         assert_eq!(v.sessions_selected, 1);
-        assert!(
-            actions
-                .iter()
-                .any(|a| matches!(a, Action::Ws(WsClientMsg::Message { .. })))
-        );
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Ws {
+                msg: WsClientMsg::Message { .. },
+                ..
+            }
+        )));
+    }
+
+    /// Two instances may share a session id; their state stays separate.
+    #[test]
+    fn same_id_on_two_instances_is_isolated() {
+        let mut v = ChatView::new();
+        let a = SessionRef::new(InstanceId(0), "s1");
+        let b = SessionRef::new(InstanceId(1), "s1");
+        v.history
+            .insert(a.clone(), vec![assistant_with_blocks("s1", 1)]);
+        v.history
+            .insert(b.clone(), vec![assistant_with_blocks("s1", 3)]);
+        assert_eq!(v.history[&a][0].blocks.len(), 1);
+        assert_eq!(v.history[&b][0].blocks.len(), 3);
+    }
+
+    /// The new-chat picker: Enter commits the highlighted instance as the
+    /// target and drops into Insert; Esc returns to the sidebar.
+    #[test]
+    fn new_chat_picker_enter_commits_target_esc_cancels() {
+        let ids = [InstanceId(0), InstanceId(1)];
+        let mut v = ChatView::new();
+        v.show_new_chat_picker(&ids);
+        assert_eq!(v.focus, FocusTier::NewChatPicker);
+        {
+            let mut a = Vec::new();
+            let mut c = ViewCtx {
+                app_actions: &mut a,
+                instances: &ids,
+            };
+            v.keys_new_chat_picker(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut c);
+            v.keys_new_chat_picker(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut c);
+        }
+        assert_eq!(v.new_chat_target, InstanceId(1));
+        assert_eq!(v.focus, FocusTier::Insert);
+
+        v.show_new_chat_picker(&ids);
+        {
+            let mut a = Vec::new();
+            let mut c = ViewCtx {
+                app_actions: &mut a,
+                instances: &ids,
+            };
+            v.keys_new_chat_picker(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut c);
+        }
+        assert_eq!(v.focus, FocusTier::Sessions);
+    }
+
+    /// Sending routes the Message over the current session's instance, not
+    /// always the primary.
+    #[test]
+    fn send_input_routes_to_current_instance() {
+        let mut v = ChatView::new();
+        v.current = SessionKey::Real(SessionRef::new(InstanceId(1), "x"));
+        v.focus = FocusTier::Insert;
+        v.input = TextArea::new(vec!["hi".into()]);
+        let mut actions = Vec::new();
+        v.send_input(&mut ctx(&mut actions));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Ws { instance, msg: WsClientMsg::Message { .. } } if *instance == InstanceId(1)
+        )));
     }
 }

@@ -4,6 +4,7 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
 use crate::api::types::HttpReq;
+use crate::instance::InstanceId;
 use crate::model::Task;
 use crate::view::list_detail::{ListDetail, ListDetailModel, meta_line, truncate};
 
@@ -27,6 +28,24 @@ impl ListDetailModel for TaskModel {
     }
     fn item_id(t: &Task) -> &str {
         &t.id
+    }
+    fn item_instance(t: &Task) -> InstanceId {
+        t.instance
+    }
+    fn set_instance(t: &mut Task, instance: InstanceId) {
+        t.instance = instance;
+    }
+    fn is_active(t: &Task) -> bool {
+        !matches!(
+            t.status.as_str(),
+            "done" | "completed" | "cancelled" | "canceled" | "archived"
+        )
+    }
+    fn sort_key(t: &Task) -> String {
+        t.updated_at
+            .clone()
+            .or_else(|| t.created_at.clone())
+            .unwrap_or_default()
     }
     fn detail_title(t: &Task) -> &str {
         &t.title
@@ -64,5 +83,23 @@ impl ListDetailModel for TaskModel {
             out.push(meta_line("created", c, 10));
         }
         out
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn task(status: &str) -> Task {
+        serde_json::from_value(serde_json::json!({ "id": "t", "status": status })).unwrap()
+    }
+
+    #[test]
+    fn finished_tasks_are_inactive() {
+        assert!(TaskModel::is_active(&task("in_progress")));
+        assert!(TaskModel::is_active(&task("pending")));
+        assert!(!TaskModel::is_active(&task("done")));
+        assert!(!TaskModel::is_active(&task("completed")));
+        assert!(!TaskModel::is_active(&task("cancelled")));
     }
 }

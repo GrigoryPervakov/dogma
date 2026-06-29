@@ -1,17 +1,17 @@
 ---
 source: tests/render.rs
-assertion_line: 336
+assertion_line: 371
 expression: "render_buf(&mut app, 80, 12)"
 ---
 dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory 
-Sessions  · / search        # + new chat                                        
-────────────────────────────                                                    
-▶ + new chat               │                                                    
-    session                │no messages yet — type below and press Enter to star
-                           │                                                    
-                           │                                                    
-                           │                                                    
-                           │┌ input · ↓ or i to focus ─────────────────────────┐
-                           ││                                                  │
-                           │└──────────────────────────────────────────────────┘
+Sessions  · / search          # + new chat                                      
+──────────────────────────────                                                  
+▶ + new chat                 │                                                  
+    session                  │no messages yet — type below and press Enter to st
+                             │                                                  
+                             │                                                  
+                             │                                                  
+                             │┌ input · ↓ or i to focus ───────────────────────┐
+                             ││                                                │
+                             │└────────────────────────────────────────────────┘
 :s▏   skills  sources   Tab complete · Enter run · Esc cancel

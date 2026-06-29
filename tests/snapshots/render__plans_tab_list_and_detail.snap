@@ -1,13 +1,13 @@
 ---
 source: tests/render.rs
-assertion_line: 460
+assertion_line: 506
 expression: "render_buf(&mut app, 100, 22)"
 ---
 dogma   chat    notifs    tasks   [plans]   skills    cron    sources    memory    diag             
-Plans (2)                           # Refactor the parser pipeline                                  
+Plans (1) · +1 hidden · a           # Refactor the parser pipeline                                  
 ────────────────────────────────────                                                                
 ▶ ◷ Refactor the parser pipeline   │status     pending                                              
-  ✓ Update webhook validation      │task       t1                                                   
+                                   │task       t1                                                   
                                    │runtime    claude                                               
                                    │created    2026-04-29 11:00:00                                  
                                    │                                                                
@@ -24,4 +24,4 @@ Plans (2)                           # Refactor the parser pipeline
                                    │                                                                
                                    │                                                                
                                    │                                                                
-NORMAL · plans │ ○ ws offline                  ↑↓/jk move · Enter open · r refresh · Tab switch tab
+NORMAL · plans │ ○ ws offline                           ↑↓/jk move · Enter open · a all · r refresh

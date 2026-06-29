@@ -21,7 +21,12 @@ pub enum AuthError {
     Other(String),
 }
 
-pub async fn authenticate(server_url: &str) -> std::result::Result<Arc<AuthHandle>, AuthError> {
+/// Authenticate against one server. A `preset` password (e.g. from the config)
+/// logs in without prompting; if it's rejected we fall back to the prompt.
+pub async fn authenticate(
+    server_url: &str,
+    preset: Option<&str>,
+) -> std::result::Result<Arc<AuthHandle>, AuthError> {
     println!("dogma — connecting to {server_url}");
 
     let probe = HttpClient::new_anonymous(server_url)
@@ -37,6 +42,25 @@ pub async fn authenticate(server_url: &str) -> std::result::Result<Arc<AuthHandl
 
     if !status.auth_required {
         return Ok(AuthHandle::new(server_url, None, Token::empty()));
+    }
+
+    // A configured password logs in without a prompt; on rejection, fall
+    // through to the interactive prompt below.
+    if let Some(pw) = preset {
+        match probe.login(pw).await {
+            Ok(token) => {
+                println!("authenticating... ok");
+                return Ok(AuthHandle::new(server_url, Some(pw.to_string()), token));
+            }
+            Err(e) => {
+                let msg = format!("{e:#}");
+                if msg.contains("incorrect password") {
+                    eprintln!("error: configured password rejected for {server_url}");
+                } else {
+                    return Err(AuthError::Other(format!("login: {msg}")));
+                }
+            }
+        }
     }
 
     for attempt in 1..=MAX_ATTEMPTS {

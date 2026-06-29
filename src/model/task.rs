@@ -22,4 +22,7 @@ pub struct Task {
     /// Populated only by `GET /api/tasks/{id}` (the detail endpoint).
     #[serde(default)]
     pub content: Option<String>,
+    /// Which Nerve instance this task came from. Stamped at ingest.
+    #[serde(default, skip)]
+    pub instance: crate::instance::InstanceId,
 }

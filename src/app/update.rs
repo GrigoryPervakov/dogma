@@ -2,11 +2,12 @@
 
 use crossterm::event::{Event as TermEvent, KeyCode, KeyEvent, KeyModifiers};
 
-use crate::api::types::{HttpResultKind, WsClientMsg, WsConnEvent, WsServerMsg};
+use crate::api::types::{HttpReq, HttpResultKind, WsClientMsg, WsConnEvent, WsServerMsg};
 use crate::app::action::Action;
 use crate::app::command::run_command;
-use crate::app::event::AppEvent;
+use crate::app::event::{AppEvent, ConnEvent};
 use crate::app::state::{App, Mode, WsConnState};
+use crate::instance::InstanceId;
 use crate::view::ViewCtx;
 use crate::view::chat::{AgentStatus, ChatView};
 
@@ -16,13 +17,20 @@ pub fn update(app: &mut App, event: AppEvent) -> Vec<Action> {
     match event {
         AppEvent::Tick => {
             // Re-render for spinners, and let the chat watchdog resync a
-            // session that's gone quiet mid-stream.
-            let ws_connected = matches!(app.ws, WsConnState::Connected);
+            // session that's gone quiet mid-stream — per instance, since each
+            // has its own WS connection.
+            let connected: Vec<bool> = app
+                .instances
+                .iter()
+                .map(|i| matches!(i.ws, WsConnState::Connected))
+                .collect();
+            let ids = app.instance_ids.clone();
             if let Some(view) = chat_view_mut(app) {
                 let mut ctx = ViewCtx {
                     app_actions: &mut actions,
+                    instances: &ids,
                 };
-                view.tick_watchdog(ws_connected, &mut ctx);
+                view.tick_watchdog(&connected, &mut ctx);
             }
             app.mark_dirty();
         }
@@ -38,16 +46,12 @@ pub fn update(app: &mut App, event: AppEvent) -> Vec<Action> {
             app.mark_dirty();
         }
         AppEvent::Term(_) => { /* ignore mouse / paste / focus for v1 */ }
-        AppEvent::Wire(msg) => {
-            actions.extend(handle_wire(app, msg));
-            app.mark_dirty();
-        }
-        AppEvent::WireConn(c) => {
-            handle_conn(app, c);
-            app.mark_dirty();
-        }
-        AppEvent::Http(res) => {
-            actions.extend(handle_http(app, res));
+        AppEvent::Inst { instance, ev } => {
+            match *ev {
+                ConnEvent::Wire(msg) => actions.extend(handle_wire(app, instance, msg)),
+                ConnEvent::WireConn(c) => actions.extend(handle_conn(app, instance, c)),
+                ConnEvent::Http(res) => actions.extend(handle_http(app, instance, res)),
+            }
             app.mark_dirty();
         }
         AppEvent::Fatal(msg) => {
@@ -75,9 +79,14 @@ fn handle_key(app: &mut App, key: KeyEvent, actions: &mut Vec<Action>) {
         }
         if let Some(chat) = chat_view_mut(app)
             && has_running_agent(chat)
-            && let Some(id) = chat.current_session_id().map(str::to_string)
+            && let Some(sref) = chat.current_session_ref().cloned()
         {
-            actions.push(Action::Ws(WsClientMsg::Stop { session_id: id }));
+            actions.push(Action::Ws {
+                instance: sref.instance,
+                msg: WsClientMsg::Stop {
+                    session_id: sref.id,
+                },
+            });
             return;
         }
         actions.push(Action::Quit);
@@ -129,10 +138,13 @@ fn handle_key(app: &mut App, key: KeyEvent, actions: &mut Vec<Action>) {
     }
 
     // Forward to the active view.
+    let ids = app.instance_ids.clone();
+    let idx = app.current_view;
     let mut ctx = ViewCtx {
         app_actions: actions,
+        instances: &ids,
     };
-    app.views[app.current_view].handle_key(key, &mut ctx);
+    app.views[idx].handle_key(key, &mut ctx);
 }
 
 fn handle_command_key(app: &mut App, key: KeyEvent, actions: &mut Vec<Action>) {
@@ -169,19 +181,21 @@ fn handle_command_key(app: &mut App, key: KeyEvent, actions: &mut Vec<Action>) {
 // Wire → state
 // --------------------------------------------------------------------------
 
-fn handle_wire(app: &mut App, msg: WsServerMsg) -> Vec<Action> {
+fn handle_wire(app: &mut App, instance: InstanceId, msg: WsServerMsg) -> Vec<Action> {
     let mut actions = Vec::new();
+    let ids = app.instance_ids.clone();
     if let Some(view) = chat_view_mut(app) {
         let mut ctx = ViewCtx {
             app_actions: &mut actions,
+            instances: &ids,
         };
-        view.apply_wire(&msg, &mut ctx);
+        view.apply_wire(instance, &msg, &mut ctx);
     }
     actions
 }
 
-fn handle_conn(app: &mut App, c: WsConnEvent) {
-    app.ws = match c {
+fn handle_conn(app: &mut App, instance: InstanceId, c: WsConnEvent) -> Vec<Action> {
+    let ws = match c {
         WsConnEvent::Connecting => WsConnState::Connecting,
         WsConnEvent::Connected => WsConnState::Connected,
         WsConnEvent::Disconnected {
@@ -196,17 +210,48 @@ fn handle_conn(app: &mut App, c: WsConnEvent) {
         },
         WsConnEvent::AuthRejected => WsConnState::AuthRejected,
     };
+    // Transition into Connected (from anything else) → refetch this instance's
+    // lists so the merged views are current after an outage / first connect.
+    let was_connected = app
+        .instances
+        .get(instance.index())
+        .map(|m| matches!(m.ws, WsConnState::Connected))
+        .unwrap_or(false);
+    let became_connected = matches!(ws, WsConnState::Connected) && !was_connected;
+    if let Some(meta) = app.instance_mut(instance) {
+        meta.ws = ws;
+    }
+    if became_connected {
+        vec![
+            Action::Http {
+                instance,
+                req: HttpReq::ListSessions,
+            },
+            Action::Http {
+                instance,
+                req: HttpReq::ListNotifications,
+            },
+        ]
+    } else {
+        Vec::new()
+    }
 }
 
-fn handle_http(app: &mut App, res: crate::api::types::HttpResult) -> Vec<Action> {
+fn handle_http(
+    app: &mut App,
+    instance: InstanceId,
+    res: crate::api::types::HttpResult,
+) -> Vec<Action> {
     let mut actions = Vec::new();
+    let ids = app.instance_ids.clone();
     let mut ctx = ViewCtx {
         app_actions: &mut actions,
+        instances: &ids,
     };
     match res.kind {
         HttpResultKind::Sessions(r) => {
             if let Some(view) = chat_view_mut(app) {
-                view.apply_sessions_loaded(r, &mut ctx);
+                view.apply_sessions_loaded(instance, r, &mut ctx);
             }
         }
         HttpResultKind::Messages {
@@ -215,7 +260,7 @@ fn handle_http(app: &mut App, res: crate::api::types::HttpResult) -> Vec<Action>
             result,
         } => {
             if let Some(view) = chat_view_mut(app) {
-                view.apply_messages_loaded(&session_id, limit, result, &mut ctx);
+                view.apply_messages_loaded(instance, &session_id, limit, result, &mut ctx);
             }
         }
         HttpResultKind::SessionCreated {
@@ -223,66 +268,66 @@ fn handle_http(app: &mut App, res: crate::api::types::HttpResult) -> Vec<Action>
             result,
         } => {
             if let Some(view) = chat_view_mut(app) {
-                view.apply_session_created(pending_content, result, &mut ctx);
+                view.apply_session_created(instance, pending_content, result, &mut ctx);
             }
         }
         HttpResultKind::Tasks(r) => {
             if let Some(view) = view_mut::<crate::view::tasks::TasksView>(app) {
-                view.apply_list_loaded(r);
+                view.apply_list_loaded(instance, r);
             }
         }
         HttpResultKind::TaskDetail { task_id, result } => {
             if let Some(view) = view_mut::<crate::view::tasks::TasksView>(app) {
-                view.apply_detail_loaded(&task_id, result);
+                view.apply_detail_loaded(instance, &task_id, result);
             }
         }
         HttpResultKind::Plans(r) => {
             if let Some(view) = view_mut::<crate::view::plans::PlansView>(app) {
-                view.apply_list_loaded(r);
+                view.apply_list_loaded(instance, r);
             }
         }
         HttpResultKind::PlanDetail { plan_id, result } => {
             if let Some(view) = view_mut::<crate::view::plans::PlansView>(app) {
-                view.apply_detail_loaded(&plan_id, result);
+                view.apply_detail_loaded(instance, &plan_id, result);
             }
         }
         HttpResultKind::Skills(r) => {
             if let Some(view) = view_mut::<crate::view::skills::SkillsView>(app) {
-                view.apply_list_loaded(r);
+                view.apply_list_loaded(instance, r);
             }
         }
         HttpResultKind::SkillDetail { skill_id, result } => {
             if let Some(view) = view_mut::<crate::view::skills::SkillsView>(app) {
-                view.apply_detail_loaded(&skill_id, result);
+                view.apply_detail_loaded(instance, &skill_id, result);
             }
         }
         HttpResultKind::Notifications(r) => {
             if let Some(view) = view_mut::<crate::view::notifications::NotificationsView>(app) {
-                view.apply_list_loaded(r);
+                view.apply_list_loaded(instance, r);
             }
         }
         HttpResultKind::NotificationAnswered { id, answer, result } => {
             if let Some(view) = view_mut::<crate::view::notifications::NotificationsView>(app) {
-                view.apply_answered(&id, &answer, result);
+                view.apply_answered(instance, &id, &answer, result);
             }
         }
         HttpResultKind::NotificationDismissed { id, result } => {
             if let Some(view) = view_mut::<crate::view::notifications::NotificationsView>(app) {
-                view.apply_dismissed(&id, result);
+                view.apply_dismissed(instance, &id, result);
             }
         }
         HttpResultKind::ModifiedFiles { session_id, result } => {
             if let Some(view) = chat_view_mut(app) {
-                view.apply_modified_files(&session_id, result);
+                view.apply_modified_files(instance, &session_id, result);
             }
         }
         HttpResultKind::FileDiff {
-            session_id: _,
+            session_id,
             path,
             result,
         } => {
             if let Some(view) = chat_view_mut(app) {
-                view.apply_file_diff(&path, result);
+                view.apply_file_diff(instance, &session_id, &path, result);
             }
         }
     }
@@ -292,10 +337,13 @@ fn handle_http(app: &mut App, res: crate::api::types::HttpResult) -> Vec<Action>
 /// Switch to the next/previous selectable view and fire its `on_focus`.
 fn cycle_view(app: &mut App, dir: isize, actions: &mut Vec<Action>) {
     app.current_view = next_selectable_view(app, dir);
+    let ids = app.instance_ids.clone();
+    let idx = app.current_view;
     let mut ctx = ViewCtx {
         app_actions: actions,
+        instances: &ids,
     };
-    app.views[app.current_view].on_focus(&mut ctx);
+    app.views[idx].on_focus(&mut ctx);
 }
 
 /// Next view index in `dir` (+1/-1) whose `selectable()` is true, wrapping
@@ -325,11 +373,11 @@ pub(crate) fn chat_view_mut(app: &mut App) -> Option<&mut ChatView> {
 }
 
 fn has_running_agent(chat: &ChatView) -> bool {
-    let session_id = match chat.current_session_id() {
+    let sref = match chat.current_session_ref() {
         Some(s) => s,
         None => return false,
     };
-    if chat.streaming.contains_key(session_id) {
+    if chat.streaming.contains_key(sref) {
         return true;
     }
     !matches!(chat.current_agent_status(), AgentStatus::Idle)
@@ -352,6 +400,27 @@ mod tests {
         let mut app = App::new("http://test".into(), Token::empty());
         chat_view_mut(&mut app).unwrap().focus = focus;
         app
+    }
+
+    #[test]
+    fn ws_connected_transition_refetches_then_noop() {
+        let mut app = App::new("http://test".into(), Token::empty());
+        // Disconnected → Connected refetches this instance's lists.
+        let acts = handle_conn(&mut app, InstanceId::PRIMARY, WsConnEvent::Connected);
+        assert!(acts.iter().any(|a| matches!(
+            a,
+            Action::Http { instance, req: HttpReq::ListSessions } if *instance == InstanceId::PRIMARY
+        )));
+        assert!(acts.iter().any(|a| matches!(
+            a,
+            Action::Http {
+                req: HttpReq::ListNotifications,
+                ..
+            }
+        )));
+        // Already connected → no repeated refetch.
+        let again = handle_conn(&mut app, InstanceId::PRIMARY, WsConnEvent::Connected);
+        assert!(again.is_empty());
     }
 
     #[test]
