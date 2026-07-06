@@ -3,6 +3,8 @@
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 
+use crossterm::event::KeyCode;
+
 use crate::api::types::HttpReq;
 use crate::instance::InstanceId;
 use crate::model::Plan;
@@ -49,6 +51,19 @@ impl ListDetailModel for PlanModel {
             .or_else(|| p.created_at.clone())
             .unwrap_or_default()
     }
+    fn key_action(p: &Plan, key: KeyCode) -> Option<HttpReq> {
+        // Uppercase so it doesn't clash with `a` (show all). Approve is only
+        // valid on a pending plan; decline closes any still-open one.
+        match key {
+            KeyCode::Char('A') if p.status == "pending" => Some(HttpReq::ApprovePlan {
+                plan_id: p.id.clone(),
+            }),
+            KeyCode::Char('D') => Some(HttpReq::DeclinePlan {
+                plan_id: p.id.clone(),
+            }),
+            _ => None,
+        }
+    }
     fn detail_title(p: &Plan) -> &str {
         p.title.as_deref().unwrap_or(if p.id.is_empty() {
             "(no plan)"
@@ -91,6 +106,15 @@ impl ListDetailModel for PlanModel {
         {
             out.push(meta_line("feedback", f, 10));
         }
+        if p.status == "pending" {
+            out.push(Line::raw(""));
+            out.push(Line::from(Span::styled(
+                "A approve · D decline",
+                Style::default()
+                    .fg(Color::Green)
+                    .add_modifier(Modifier::BOLD),
+            )));
+        }
         out
     }
 }
@@ -112,5 +136,27 @@ mod tests {
         assert!(!PlanModel::is_active(&plan("declined")));
         assert!(!PlanModel::is_active(&plan("superseded")));
         assert!(!PlanModel::is_active(&plan("done")));
+    }
+
+    #[test]
+    fn approve_is_pending_only_decline_is_open() {
+        // A approves only a pending plan.
+        assert!(matches!(
+            PlanModel::key_action(&plan("pending"), KeyCode::Char('A')),
+            Some(HttpReq::ApprovePlan { .. })
+        ));
+        assert!(PlanModel::key_action(&plan("proposed"), KeyCode::Char('A')).is_none());
+        // D declines any still-open plan.
+        assert!(matches!(
+            PlanModel::key_action(&plan("pending"), KeyCode::Char('D')),
+            Some(HttpReq::DeclinePlan { .. })
+        ));
+        assert!(matches!(
+            PlanModel::key_action(&plan("implementing"), KeyCode::Char('D')),
+            Some(HttpReq::DeclinePlan { .. })
+        ));
+        // Lowercase a/d are not plan actions (a = show all).
+        assert!(PlanModel::key_action(&plan("pending"), KeyCode::Char('a')).is_none());
+        assert!(PlanModel::key_action(&plan("pending"), KeyCode::Char('d')).is_none());
     }
 }

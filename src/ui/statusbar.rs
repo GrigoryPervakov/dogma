@@ -344,7 +344,8 @@ fn right_hint(app: &App) -> String {
                 }
             } else {
                 match active_view_id(app) {
-                    Some("tasks") | Some("plans") | Some("skills") => {
+                    Some("plans") => "↑↓ move · A approve · D decline · a all · r refresh".into(),
+                    Some("tasks") | Some("skills") => {
                         "↑↓/jk move · Enter open · a all · r refresh".into()
                     }
                     Some("notifs") => "↑↓ move · 1-9 answer · d dismiss · a all · r refresh".into(),

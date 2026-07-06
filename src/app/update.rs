@@ -291,6 +291,13 @@ fn handle_http(
                 view.apply_detail_loaded(instance, &plan_id, result);
             }
         }
+        HttpResultKind::PlanActed { plan_id, result } => {
+            if let Some(view) = view_mut::<crate::view::plans::PlansView>(app) {
+                view.apply_action_result(&plan_id, result);
+            }
+            // The plan's status changed server-side — refetch to reconcile.
+            ctx.http(instance, HttpReq::ListPlans);
+        }
         HttpResultKind::Skills(r) => {
             if let Some(view) = view_mut::<crate::view::skills::SkillsView>(app) {
                 view.apply_list_loaded(instance, r);

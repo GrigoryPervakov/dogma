@@ -97,6 +97,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         head("TASKS · PLANS · SKILLS"),
         row("  ↑↓/jk move · Enter/→ detail · a all · r refresh"),
         row("  (lists are time-sorted; a shows done/declined items)"),
+        row("  Plans   A approve · D decline a pending plan"),
         Line::from(""),
         Line::from(Span::styled(
             "press any key to close",

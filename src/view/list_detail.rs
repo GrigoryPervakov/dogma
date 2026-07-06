@@ -124,6 +124,12 @@ pub trait ListDetailModel: 'static {
         String::new()
     }
 
+    /// Map a key press on the selected item to an action request (e.g. approve
+    /// a plan), routed to the item's instance. Default: no item actions.
+    fn key_action(_item: &Self::Item, _key: KeyCode) -> Option<HttpReq> {
+        None
+    }
+
     /// Fold a freshly-fetched detail into what the list row already had (e.g.
     /// carry over stats the detail endpoint omits). Default: take the detail.
     fn merge_detail(_row: Option<&Self::Item>, detail: Self::Item) -> Self::Item {
@@ -265,6 +271,14 @@ impl<M: ListDetailModel> ListDetail<M> {
             Err(e) => self.last_error = Some(format!("{}({id}): {e}", M::ID)),
         }
     }
+
+    /// Note the result of an item action (approve/decline). Errors surface in
+    /// the header; the caller refetches the list to reflect the new state.
+    pub fn apply_action_result(&mut self, id: &str, result: std::result::Result<(), String>) {
+        if let Err(e) = result {
+            self.last_error = Some(format!("{}({id}): {e}", M::ID));
+        }
+    }
 }
 
 impl<M: ListDetailModel> View for ListDetail<M> {
@@ -296,7 +310,16 @@ impl<M: ListDetailModel> View for ListDetail<M> {
                     self.clamp_selection();
                     self.ensure_detail_fetched(ctx);
                 }
-                _ => {}
+                // Model-specific action on the selected item (e.g. approve a
+                // plan), routed to that item's instance.
+                other => {
+                    let act = self.shown().get(self.selected).copied().and_then(|it| {
+                        M::key_action(it, other).map(|req| (M::item_instance(it), req))
+                    });
+                    if let Some((instance, req)) = act {
+                        ctx.http(instance, req);
+                    }
+                }
             },
         }
     }

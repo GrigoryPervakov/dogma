@@ -11,6 +11,8 @@ Plans (1) · +1 hidden · a           # Refactor the parser pipeline
                                    │runtime    claude                                               
                                    │created    2026-04-29 11:00:00                                  
                                    │                                                                
+                                   │A approve · D decline                                           
+                                   │                                                                
                                    │Goal                                                            
                                    │                                                                
                                    │Split the monolithic parse loop into named steps.               
@@ -22,6 +24,4 @@ Plans (1) · +1 hidden · a           # Refactor the parser pipeline
                                    │3. Extract `apply` step                                         
                                    │4. Wire the pipeline registry                                   
                                    │                                                                
-                                   │                                                                
-                                   │                                                                
-NORMAL · plans │ ○ ws offline                           ↑↓/jk move · Enter open · a all · r refresh
+NORMAL · plans │ ○ ws offline                   ↑↓ move · A approve · D decline · a all · r refresh

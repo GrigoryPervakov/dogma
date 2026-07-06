@@ -322,6 +322,26 @@ impl HttpClient {
             .await
     }
 
+    /// Approve a pending plan (spawns an implementation session server-side).
+    pub async fn approve_plan(&self, plan_id: &str) -> Result<()> {
+        let url = self.url(&format!("/api/plans/{plan_id}/approve"));
+        let resp = self
+            .send(move |c| c.post(url.as_str()).json(&json!({})))
+            .await
+            .context("POST /api/plans/{id}/approve")?;
+        ensure_ok(&resp, "approve plan")
+    }
+
+    /// Decline a plan via `PATCH` with `status=declined`.
+    pub async fn decline_plan(&self, plan_id: &str) -> Result<()> {
+        let url = self.url(&format!("/api/plans/{plan_id}"));
+        let resp = self
+            .send(move |c| c.patch(url.as_str()).json(&json!({ "status": "declined" })))
+            .await
+            .context("PATCH /api/plans/{id}")?;
+        ensure_ok(&resp, "decline plan")
+    }
+
     pub async fn list_skills(&self) -> Result<Vec<Skill>> {
         Ok(self
             .get_json::<SkillsResp>("/api/skills", "list skills")

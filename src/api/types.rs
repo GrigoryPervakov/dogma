@@ -294,6 +294,12 @@ pub enum HttpReq {
     GetPlan {
         plan_id: String,
     },
+    ApprovePlan {
+        plan_id: String,
+    },
+    DeclinePlan {
+        plan_id: String,
+    },
 
     ListSkills,
     GetSkill {
@@ -351,6 +357,11 @@ pub enum HttpResultKind {
     PlanDetail {
         plan_id: String,
         result: Result<Plan, String>,
+    },
+    /// Result of an approve/decline action; the view refetches on success.
+    PlanActed {
+        plan_id: String,
+        result: Result<(), String>,
     },
     Skills(Result<Vec<Skill>, String>),
     SkillDetail {

@@ -392,6 +392,20 @@ async fn run_http(http: &HttpClient, req: HttpReq) -> HttpResultKind {
             let result = http.get_plan(&plan_id).await.map_err(|e| format!("{e:#}"));
             HttpResultKind::PlanDetail { plan_id, result }
         }
+        HttpReq::ApprovePlan { plan_id } => {
+            let result = http
+                .approve_plan(&plan_id)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            HttpResultKind::PlanActed { plan_id, result }
+        }
+        HttpReq::DeclinePlan { plan_id } => {
+            let result = http
+                .decline_plan(&plan_id)
+                .await
+                .map_err(|e| format!("{e:#}"));
+            HttpResultKind::PlanActed { plan_id, result }
+        }
         HttpReq::ListSkills => {
             HttpResultKind::Skills(http.list_skills().await.map_err(|e| format!("{e:#}")))
         }
