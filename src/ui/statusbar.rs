@@ -44,6 +44,14 @@ pub fn render(app: &App, frame: &mut Frame, area: Rect) {
             push_sep(&mut spans);
             spans.extend(session_spans(chat));
 
+            if let Some(badge) = backend_model_badge(chat) {
+                push_sep(&mut spans);
+                spans.push(Span::styled(
+                    badge,
+                    Style::default().add_modifier(Modifier::DIM),
+                ));
+            }
+
             push_sep(&mut spans);
             spans.extend(conn_spans(app));
 
@@ -187,6 +195,54 @@ fn session_spans(chat: &ChatView) -> Vec<Span<'static>> {
         None => "session: + new chat".to_string(),
     };
     vec![Span::raw(label)]
+}
+
+/// `backend · model` badge for the selected session (either part optional):
+/// the sticky agent backend plus the resolved model bound to it.
+fn backend_model_badge(chat: &ChatView) -> Option<String> {
+    let sref = chat.current_session_ref()?;
+    let s = chat
+        .sessions
+        .iter()
+        .find(|s| s.instance == sref.instance && s.id == sref.id)?;
+    let model = s.model.as_deref().map(model_label);
+    match (s.backend.as_deref(), model) {
+        (Some(b), Some(m)) => Some(format!("{b} · {m}")),
+        (Some(b), None) => Some(b.to_string()),
+        (None, Some(m)) => Some(m),
+        (None, None) => None,
+    }
+}
+
+/// Shorten a model identifier for display, e.g. `claude-opus-4-8-20260528` →
+/// `Opus 4.8`. Mirrors the web frontend's `formatModelLabel`.
+fn model_label(model: &str) -> String {
+    let m = model.strip_prefix("claude-").unwrap_or(model);
+    if let Some((name, major, minor)) = split_family(m) {
+        return format!("{} {}.{}", capitalize(name), major, minor);
+    }
+    capitalize(m)
+}
+
+/// Split `name-major-minor…` where major/minor are decimal runs, mirroring the
+/// web regex `^(\w+)-(\d+)-(\d+)`. Trailing segments (dated suffix) are ignored.
+fn split_family(m: &str) -> Option<(&str, &str, &str)> {
+    let mut it = m.splitn(3, '-');
+    let name = it.next()?;
+    let major = it.next()?;
+    let minor = it.next()?.split('-').next()?;
+    let is_word =
+        |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_alphanumeric() || c == '_');
+    let is_num = |s: &str| !s.is_empty() && s.chars().all(|c| c.is_ascii_digit());
+    (is_word(name) && is_num(major) && is_num(minor)).then_some((name, major, minor))
+}
+
+fn capitalize(s: &str) -> String {
+    let mut c = s.chars();
+    match c.next() {
+        Some(first) => first.to_uppercase().collect::<String>() + c.as_str(),
+        None => String::new(),
+    }
 }
 
 /// Connection summary: a single `ws` dot when one instance is connected, or a
@@ -338,7 +394,10 @@ fn right_hint(app: &App) -> String {
                     }
                     Some(FocusTier::Files) => "↑↓ files · Enter diff · Esc back".into(),
                     Some(FocusTier::NewChatPicker) => {
-                        "↑↓ pick instance · Enter ok · Esc cancel".into()
+                        "←→ section · ↑↓ pick · Enter start · Esc cancel".into()
+                    }
+                    Some(FocusTier::ModelPicker) => {
+                        "↑↓ pick model · Enter select · Esc cancel".into()
                     }
                     None => "press : for command, ? for help".into(),
                 }
@@ -377,6 +436,7 @@ fn mode_label(app: &App) -> String {
                     FocusTier::Poll => return "POLL".into(),
                     FocusTier::Files => return "FILES".into(),
                     FocusTier::NewChatPicker => return "NEW CHAT".into(),
+                    FocusTier::ModelPicker => return "MODEL".into(),
                 };
                 return format!("NORMAL · {tier}");
             }
@@ -421,4 +481,23 @@ fn push_sep(spans: &mut Vec<Span<'_>>) {
 
 fn line_width(line: &Line<'_>) -> usize {
     line.spans.iter().map(|s| s.content.chars().count()).sum()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::model_label;
+
+    #[test]
+    fn model_label_shortens_claude_ids() {
+        assert_eq!(model_label("claude-opus-4-8-20260528"), "Opus 4.8");
+        assert_eq!(model_label("claude-sonnet-4-5"), "Sonnet 4.5");
+        assert_eq!(model_label("claude-haiku-4-5-20260101"), "Haiku 4.5");
+    }
+
+    #[test]
+    fn model_label_falls_back_to_capitalized() {
+        assert_eq!(model_label("llama3.1"), "Llama3.1");
+        assert_eq!(model_label("gpt-4o"), "Gpt-4o");
+        assert_eq!(model_label(""), "");
+    }
 }

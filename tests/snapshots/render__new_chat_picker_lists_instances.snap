@@ -1,6 +1,6 @@
 ---
 source: tests/render.rs
-assertion_line: 198
+assertion_line: 202
 expression: "render_buf(&mut app, 100, 16)"
 ---
 dogma  [chat]   notifs    tasks    plans    skills    cron    sources    memory    diag             
@@ -11,11 +11,11 @@ Sessions  · / search          # + new chat
                              │                                                                      
                              │                                                                      
                              │                                                                      
+                             │                                                                      
                              │┌ new chat ──────────────────────────────────────────────────────────┐
-                             ││Start new chat on:                                                  │
+                             ││  instance                                                          │
                              ││                                                                    │
                              ││▸ ● local                                                           │
                              ││  ◆ vm                                                              │
-                             ││                                                                    │
                              │└────────────────────────────────────────────────────────────────────┘
-NEW CHAT │ idle │ session: + new chat │ ● local · ◆ vm │ ctx — ↑↓ pick instance · Enter ok · Esc can
+NEW CHAT │ idle │ session: + new chat │ ● local · ◆ vm │ ctx — ←→ section · ↑↓ pick · Enter start ·

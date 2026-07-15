@@ -8,7 +8,9 @@ use ratatui::layout::Rect;
 
 use crate::ui::textarea::TextArea;
 
-use crate::api::types::{HttpReq, MessagesPayload, WsClientMsg, WsServerMsg};
+use crate::api::types::{
+    BackendsInfo, HttpReq, MessagesPayload, ModelOption, ModelsPayload, WsClientMsg, WsServerMsg,
+};
 use crate::app::action::Action;
 use crate::instance::InstanceId;
 use crate::model::{Block, ContextUsage, Message, Session};
@@ -30,8 +32,34 @@ pub enum FocusTier {
     Poll,
     /// Browsing the session's changed-files list / a file diff.
     Files,
-    /// Choosing which instance a new chat lands on (only when >1 connected).
+    /// New-chat setup form: instance / backend / model columns, shown only
+    /// when at least one of them offers a real choice.
     NewChatPicker,
+    /// Choosing the composer model (only when >1 model is offered).
+    ModelPicker,
+}
+
+/// One column of the new-chat setup form.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetupCol {
+    Instance,
+    Backend,
+    Model,
+}
+
+/// Step `cur` by `dir` within `0..len`, skipping items rejected by `ok`.
+/// Stays put when nothing acceptable exists in that direction.
+fn step_index(len: usize, cur: usize, dir: isize, ok: impl Fn(usize) -> bool) -> usize {
+    let mut i = cur as isize;
+    loop {
+        i += dir;
+        if i < 0 || i >= len as isize {
+            return cur;
+        }
+        if ok(i as usize) {
+            return i as usize;
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -233,13 +261,16 @@ fn compute_top_for_bottom(
 // Side panel — sub-agents
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Clone)]
 pub struct SubAgentPanel {
     pub tool_use_id: String,
     pub kind: String, // "Plan" | "Agent" | "Explore" | ...
     pub description: String,
     pub blocks: Vec<Block>,
     pub running: bool,
+    /// Session the sub-agent belongs to — the strip shows only the current
+    /// session's panels, and a finished turn prunes its session's entries.
+    pub session: SessionRef,
 }
 
 #[derive(Debug, Default)]
@@ -302,10 +333,29 @@ pub struct ChatView {
     // Active session
     pub current: SessionKey,
     /// Which instance a brand-new chat is created on (the `+ new chat` row),
-    /// chosen via the `NewChatPicker` tier when several instances are connected.
+    /// chosen via the new-chat setup form when several instances are connected.
     pub new_chat_target: InstanceId,
-    /// Cursor in the new-chat instance picker.
-    pub new_chat_pick: usize,
+    /// Focused column of the new-chat setup form.
+    pub setup_col: SetupCol,
+
+    // Backend + model pickers (from `GET /api/models`)
+    /// Selectable chat models per instance, tagged with their backend.
+    pub models: HashMap<InstanceId, Vec<ModelOption>>,
+    /// Per-instance default model per backend (`defaults` in the payload).
+    pub model_defaults: HashMap<InstanceId, HashMap<String, String>>,
+    /// Per-instance agent backends (`backends` block; absent on old servers).
+    pub backends: HashMap<InstanceId, BackendsInfo>,
+    /// Composer model override per backend, sent on the next message.
+    /// Absent = backend default. Mirrors the web's `selectedModels`.
+    pub selected_models: HashMap<String, String>,
+    /// Backend for the next new chat (`None` = server default). Consumed and
+    /// reset when the session materializes, mirroring the web's
+    /// `newChatBackend`.
+    pub new_chat_backend: Option<String>,
+    /// Cursor in the standalone `:model` picker.
+    pub model_pick: usize,
+    /// Which backend the open model picker edits.
+    pub model_picker_backend: String,
 
     // Chat state per session (history + streaming buffer + UI bits)
     pub history: HashMap<SessionRef, Vec<Message>>,
@@ -376,7 +426,14 @@ impl ChatView {
             sidebar_search_active: false,
             current: SessionKey::NewChat,
             new_chat_target: InstanceId::PRIMARY,
-            new_chat_pick: 0,
+            setup_col: SetupCol::Instance,
+            models: HashMap::new(),
+            model_defaults: HashMap::new(),
+            backends: HashMap::new(),
+            selected_models: HashMap::new(),
+            new_chat_backend: None,
+            model_pick: 0,
+            model_picker_backend: String::new(),
             history: HashMap::new(),
             streaming: HashMap::new(),
             agent_status: HashMap::new(),
@@ -422,6 +479,19 @@ impl ChatView {
         match &self.current {
             SessionKey::Real(s) => s.instance,
             SessionKey::NewChat => self.new_chat_target,
+        }
+    }
+
+    /// Sub-agent panels belonging to the session on screen.
+    pub fn current_panels(&self) -> Vec<&SubAgentPanel> {
+        match self.current_session_ref() {
+            Some(sref) => self
+                .side_panel
+                .panels
+                .iter()
+                .filter(|p| p.session == *sref)
+                .collect(),
+            None => Vec::new(),
         }
     }
 
@@ -945,6 +1015,21 @@ impl ChatView {
         match result {
             Ok(mut session) => {
                 session.instance = instance;
+                // POST returns a partial row — stamp the backend it was created
+                // with so the badge and model resolution are right before the
+                // next sessions refresh.
+                if session.backend.is_none() {
+                    session.backend = self
+                        .new_chat_backend
+                        .clone()
+                        .or_else(|| self.backends.get(&instance).map(|b| b.default.clone()));
+                }
+                self.new_chat_backend = None;
+                let backend = session
+                    .backend
+                    .clone()
+                    .unwrap_or_else(|| "claude".to_string());
+                let first_msg_model = self.selected_models.get(&backend).cloned();
                 let sref = SessionRef::new(instance, session.id.clone());
                 // Insert at top of live group.
                 self.sessions.insert(0, session);
@@ -970,6 +1055,7 @@ impl ChatView {
                             session_id: sref.id.clone(),
                             content: content.clone(),
                             file_ids: None,
+                            model: first_msg_model,
                         },
                     );
                     // Optimistically append the user message to history.
@@ -1055,46 +1141,295 @@ impl ChatView {
                 self.focus_interaction_if_pending();
             }
             SessionKey::NewChat => {
-                if ctx.instances.len() > 1 {
-                    self.show_new_chat_picker(ctx.instances);
+                self.show_new_chat_setup(ctx.instances);
+            }
+        }
+    }
+
+    /// Open the new-chat setup form (instance / backend / model columns).
+    /// Goes straight to Insert when no column offers a real choice.
+    pub fn show_new_chat_setup(&mut self, instances: &[InstanceId]) {
+        match self.setup_cols(instances.len()).first() {
+            Some(&first) => {
+                self.setup_col = first;
+                self.focus = FocusTier::NewChatPicker;
+            }
+            None => self.focus = FocusTier::Insert,
+        }
+    }
+
+    /// Form columns that currently offer more than one choice. Later columns
+    /// re-derive from earlier answers (instance → backends → models).
+    pub fn setup_cols(&self, n_instances: usize) -> Vec<SetupCol> {
+        let mut cols = Vec::new();
+        if n_instances > 1 {
+            cols.push(SetupCol::Instance);
+        }
+        let backends = self
+            .backends
+            .get(&self.current_instance())
+            .map(|b| b.options.len())
+            .unwrap_or(0);
+        if backends > 1 {
+            cols.push(SetupCol::Backend);
+        }
+        if self.backend_models(&self.current_backend()).len() > 1 {
+            cols.push(SetupCol::Model);
+        }
+        cols
+    }
+
+    pub fn setup_instance_index(&self, instances: &[InstanceId]) -> usize {
+        instances
+            .iter()
+            .position(|&i| i == self.new_chat_target)
+            .unwrap_or(0)
+    }
+
+    pub fn setup_backend_index(&self) -> usize {
+        let Some(info) = self.backends.get(&self.current_instance()) else {
+            return 0;
+        };
+        let active = self.new_chat_backend.as_deref().unwrap_or(&info.default);
+        info.options
+            .iter()
+            .position(|o| o.id == active)
+            .unwrap_or(0)
+    }
+
+    pub fn setup_model_index(&self) -> usize {
+        let backend = self.current_backend();
+        let active = self
+            .selected_models
+            .get(&backend)
+            .cloned()
+            .or_else(|| self.default_model_for(&backend));
+        active
+            .and_then(|id| {
+                self.backend_models(&backend)
+                    .iter()
+                    .position(|m| m.id == id)
+            })
+            .unwrap_or(0)
+    }
+
+    fn keys_new_chat_setup(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
+        let cols = self.setup_cols(ctx.instances.len());
+        if cols.is_empty() {
+            self.focus = FocusTier::Insert;
+            return;
+        }
+        // An earlier answer may have removed the focused column.
+        let col_idx = match cols.iter().position(|&c| c == self.setup_col) {
+            Some(i) => i,
+            None => {
+                self.setup_col = cols[cols.len() - 1];
+                cols.len() - 1
+            }
+        };
+        match key.code {
+            KeyCode::Left | KeyCode::Char('h') => {
+                if col_idx == 0 {
+                    self.focus = FocusTier::Sessions;
                 } else {
-                    self.focus = FocusTier::Insert;
+                    self.setup_col = cols[col_idx - 1];
+                }
+            }
+            KeyCode::Right | KeyCode::Char('l') => {
+                if col_idx + 1 < cols.len() {
+                    self.setup_col = cols[col_idx + 1];
+                }
+            }
+            KeyCode::Tab => {
+                self.setup_col = cols[(col_idx + 1) % cols.len()];
+            }
+            KeyCode::Up | KeyCode::Char('k') => self.setup_move(-1, ctx),
+            KeyCode::Down | KeyCode::Char('j') => self.setup_move(1, ctx),
+            KeyCode::Enter => {
+                self.focus = FocusTier::Insert;
+            }
+            KeyCode::Esc => {
+                self.focus = FocusTier::Sessions;
+            }
+            _ => {}
+        }
+    }
+
+    /// Move the focused column's answer by `dir`. The answer commits in place —
+    /// the cursor *is* the selection — so later columns re-derive immediately.
+    fn setup_move(&mut self, dir: isize, ctx: &ViewCtx) {
+        match self.setup_col {
+            SetupCol::Instance => {
+                let cur = self.setup_instance_index(ctx.instances);
+                let next = step_index(ctx.instances.len(), cur, dir, |_| true);
+                if let Some(&id) = ctx.instances.get(next) {
+                    self.new_chat_target = id;
+                }
+            }
+            SetupCol::Backend => {
+                let inst = self.current_instance();
+                let picked = {
+                    let Some(info) = self.backends.get(&inst) else {
+                        return;
+                    };
+                    let cur = self.setup_backend_index();
+                    let next =
+                        step_index(info.options.len(), cur, dir, |i| info.options[i].available);
+                    info.options
+                        .get(next)
+                        .map(|o| (o.id.clone(), info.default.clone()))
+                };
+                if let Some((id, default)) = picked {
+                    self.new_chat_backend = if id == default { None } else { Some(id) };
+                }
+            }
+            SetupCol::Model => {
+                let backend = self.current_backend();
+                let models: Vec<String> = self
+                    .backend_models(&backend)
+                    .iter()
+                    .map(|m| m.id.clone())
+                    .collect();
+                let cur = self.setup_model_index();
+                let next = step_index(models.len(), cur, dir, |_| true);
+                if let Some(id) = models.get(next).cloned() {
+                    if self.default_model_for(&backend).as_deref() == Some(id.as_str()) {
+                        self.selected_models.remove(&backend);
+                    } else {
+                        self.selected_models.insert(backend, id);
+                    }
                 }
             }
         }
     }
 
-    /// Open the instance picker for a new chat, with the cursor on the current
-    /// target. Caller guarantees more than one instance is connected.
-    pub fn show_new_chat_picker(&mut self, instances: &[InstanceId]) {
-        self.new_chat_pick = instances
-            .iter()
-            .position(|&i| i == self.new_chat_target)
-            .unwrap_or(0);
-        self.focus = FocusTier::NewChatPicker;
+    /// Backend of the composer's target: the session's sticky backend, or the
+    /// new-chat choice (falling back to the instance default) while composing.
+    pub fn current_backend(&self) -> String {
+        let inst_default = || {
+            self.backends
+                .get(&self.current_instance())
+                .map(|b| b.default.clone())
+                .unwrap_or_else(|| "claude".to_string())
+        };
+        match &self.current {
+            SessionKey::Real(sref) => self
+                .sessions
+                .iter()
+                .find(|s| s.instance == sref.instance && s.id == sref.id)
+                .and_then(|s| s.backend.clone())
+                .unwrap_or_else(inst_default),
+            SessionKey::NewChat => self.new_chat_backend.clone().unwrap_or_else(inst_default),
+        }
     }
 
-    fn keys_new_chat_picker(&mut self, key: KeyEvent, ctx: &mut ViewCtx) {
-        let n = ctx.instances.len();
+    /// Current instance's models served by `backend`. Untagged models (from a
+    /// pre-backend server) count for every backend.
+    pub fn backend_models(&self, backend: &str) -> Vec<&ModelOption> {
+        self.models
+            .get(&self.current_instance())
+            .into_iter()
+            .flatten()
+            .filter(|m| m.backend == backend || m.backend.is_empty())
+            .collect()
+    }
+
+    fn default_model_for(&self, backend: &str) -> Option<String> {
+        self.model_defaults
+            .get(&self.current_instance())
+            .and_then(|d| d.get(backend))
+            .cloned()
+    }
+
+    /// Model override the next message should carry (`None` = server default).
+    pub fn pending_model_override(&self) -> Option<String> {
+        self.selected_models.get(&self.current_backend()).cloned()
+    }
+
+    /// Open the model picker for the composer's current backend (`:model`).
+    /// No-op (with a hint) when that backend serves a single model.
+    pub fn show_model_picker(&mut self) {
+        let backend = self.current_backend();
+        if self.backend_models(&backend).len() <= 1 {
+            self.last_error = Some(format!("only one model available on {backend}"));
+            return;
+        }
+        self.show_model_picker_for(backend);
+    }
+
+    fn show_model_picker_for(&mut self, backend: String) {
+        let active = self
+            .selected_models
+            .get(&backend)
+            .cloned()
+            .or_else(|| self.default_model_for(&backend));
+        self.model_pick = active
+            .and_then(|id| {
+                self.backend_models(&backend)
+                    .iter()
+                    .position(|m| m.id == id)
+            })
+            .unwrap_or(0);
+        self.model_picker_backend = backend;
+        self.focus = FocusTier::ModelPicker;
+    }
+
+    fn keys_model_picker(&mut self, key: KeyEvent) {
+        let backend = self.model_picker_backend.clone();
+        let n = self.backend_models(&backend).len();
         match key.code {
             KeyCode::Up | KeyCode::Char('k') => {
-                self.new_chat_pick = self.new_chat_pick.saturating_sub(1);
+                self.model_pick = self.model_pick.saturating_sub(1);
             }
             KeyCode::Down | KeyCode::Char('j') => {
-                if self.new_chat_pick + 1 < n {
-                    self.new_chat_pick += 1;
+                if self.model_pick + 1 < n {
+                    self.model_pick += 1;
                 }
             }
             KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => {
-                if let Some(&id) = ctx.instances.get(self.new_chat_pick) {
-                    self.new_chat_target = id;
+                if let Some(id) = self
+                    .backend_models(&backend)
+                    .get(self.model_pick)
+                    .map(|m| m.id.clone())
+                {
+                    if self.default_model_for(&backend).as_deref() == Some(id.as_str()) {
+                        self.selected_models.remove(&backend);
+                    } else {
+                        self.selected_models.insert(backend, id);
+                    }
                 }
                 self.focus = FocusTier::Insert;
             }
             KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => {
-                self.focus = FocusTier::Sessions;
+                // Mid-chain (new chat): accept the default and start typing.
+                self.focus = match self.current {
+                    SessionKey::NewChat => FocusTier::Insert,
+                    SessionKey::Real(_) => FocusTier::Input,
+                };
             }
             _ => {}
+        }
+    }
+
+    pub fn apply_models_loaded(
+        &mut self,
+        instance: InstanceId,
+        result: std::result::Result<ModelsPayload, String>,
+    ) {
+        match result {
+            Ok(payload) => {
+                let mut defaults = payload.defaults;
+                if defaults.is_empty() && !payload.default.is_empty() {
+                    // Pre-backend server: a single default under "claude".
+                    defaults.insert("claude".to_string(), payload.default);
+                }
+                self.model_defaults.insert(instance, defaults);
+                if let Some(backends) = payload.backends {
+                    self.backends.insert(instance, backends);
+                }
+                self.models.insert(instance, payload.models);
+            }
+            Err(e) => self.last_error = Some(format!("list models: {e}")),
         }
     }
 
@@ -1588,6 +1923,15 @@ impl ChatView {
         }
     }
 
+    /// Insert pasted text into the composer, entering Insert mode. Ignored
+    /// unless the input is already focused so a stray paste elsewhere is inert.
+    pub fn paste_into_input(&mut self, text: &str) {
+        if matches!(self.focus, FocusTier::Input | FocusTier::Insert) {
+            self.input.insert_str(text);
+            self.focus = FocusTier::Insert;
+        }
+    }
+
     fn send_input(&mut self, ctx: &mut ViewCtx) {
         let content = self.input.lines().join("\n");
         if content.trim().is_empty() {
@@ -1601,6 +1945,7 @@ impl ChatView {
                         session_id: sref.id.clone(),
                         content: content.clone(),
                         file_ids: None,
+                        model: self.pending_model_override(),
                     },
                 );
                 // Optimistic local append.
@@ -1631,6 +1976,7 @@ impl ChatView {
                     HttpReq::CreateSession {
                         title: None,
                         content: Some(content),
+                        backend: self.new_chat_backend.clone(),
                     },
                 );
                 self.drafts.clear(&SessionKey::NewChat);
@@ -1677,7 +2023,11 @@ impl View for ChatView {
         // typing (see `keys_input_focused`).
         matches!(
             self.focus,
-            FocusTier::Insert | FocusTier::Poll | FocusTier::Files | FocusTier::NewChatPicker
+            FocusTier::Insert
+                | FocusTier::Poll
+                | FocusTier::Files
+                | FocusTier::NewChatPicker
+                | FocusTier::ModelPicker
         )
     }
 
@@ -1690,7 +2040,8 @@ impl View for ChatView {
             FocusTier::Insert => self.keys_insert(key, ctx),
             FocusTier::Poll => self.keys_poll(key, ctx),
             FocusTier::Files => self.keys_files(key, ctx),
-            FocusTier::NewChatPicker => self.keys_new_chat_picker(key, ctx),
+            FocusTier::NewChatPicker => self.keys_new_chat_setup(key, ctx),
+            FocusTier::ModelPicker => self.keys_model_picker(key),
         }
     }
 
@@ -2317,13 +2668,13 @@ mod tests {
         assert_eq!(v.history[&b][0].blocks.len(), 3);
     }
 
-    /// The new-chat picker: Enter commits the highlighted instance as the
-    /// target and drops into Insert; Esc returns to the sidebar.
+    /// The setup form: ↑↓ re-picks the instance in place, Enter drops into
+    /// Insert; Esc returns to the sidebar.
     #[test]
     fn new_chat_picker_enter_commits_target_esc_cancels() {
         let ids = [InstanceId(0), InstanceId(1)];
         let mut v = ChatView::new();
-        v.show_new_chat_picker(&ids);
+        v.show_new_chat_setup(&ids);
         assert_eq!(v.focus, FocusTier::NewChatPicker);
         {
             let mut a = Vec::new();
@@ -2331,22 +2682,249 @@ mod tests {
                 app_actions: &mut a,
                 instances: &ids,
             };
-            v.keys_new_chat_picker(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut c);
-            v.keys_new_chat_picker(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut c);
+            // ↓ re-picks in place — the answer commits without Enter.
+            v.keys_new_chat_setup(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE), &mut c);
+            assert_eq!(v.new_chat_target, InstanceId(1));
+            v.keys_new_chat_setup(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE), &mut c);
         }
-        assert_eq!(v.new_chat_target, InstanceId(1));
         assert_eq!(v.focus, FocusTier::Insert);
 
-        v.show_new_chat_picker(&ids);
+        v.show_new_chat_setup(&ids);
         {
             let mut a = Vec::new();
             let mut c = ViewCtx {
                 app_actions: &mut a,
                 instances: &ids,
             };
-            v.keys_new_chat_picker(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut c);
+            v.keys_new_chat_setup(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE), &mut c);
         }
         assert_eq!(v.focus, FocusTier::Sessions);
+    }
+
+    /// Paste inserts multi-line text only when the composer is focused, and
+    /// drops into Insert.
+    #[test]
+    fn paste_into_input_only_when_input_focused() {
+        let mut v = ChatView::new();
+        v.current = SessionKey::Real("s1".into());
+        v.focus = FocusTier::ChatBlocks;
+        v.paste_into_input("ignored");
+        assert!(v.input.lines().iter().all(|l| l.is_empty()));
+
+        v.focus = FocusTier::Input;
+        v.paste_into_input("a\nb");
+        assert_eq!(v.input.lines(), &["a".to_string(), "b".to_string()]);
+        assert_eq!(v.focus, FocusTier::Insert);
+    }
+
+    fn model(id: &str, provider: &str, backend: &str) -> ModelOption {
+        ModelOption {
+            id: id.to_string(),
+            provider: provider.to_string(),
+            backend: backend.to_string(),
+        }
+    }
+
+    /// Two backends (claude default), each serving two models.
+    fn models_payload() -> ModelsPayload {
+        use crate::api::types::BackendOption;
+        let opt = |id: &str| BackendOption {
+            id: id.to_string(),
+            label: String::new(),
+            available: true,
+            reason: None,
+        };
+        ModelsPayload {
+            default: "claude-sonnet-4-5".to_string(),
+            defaults: [
+                ("claude".to_string(), "claude-sonnet-4-5".to_string()),
+                ("codex".to_string(), "gpt-5-codex".to_string()),
+            ]
+            .into_iter()
+            .collect(),
+            backends: Some(BackendsInfo {
+                default: "claude".to_string(),
+                options: vec![opt("claude"), opt("codex")],
+            }),
+            models: vec![
+                model("claude-sonnet-4-5", "anthropic", "claude"),
+                model("claude-opus-4-8", "anthropic", "claude"),
+                model("gpt-5-codex", "openai", "codex"),
+                model("gpt-5", "openai", "codex"),
+            ],
+        }
+    }
+
+    /// Picking a non-default model sets the backend's override and it rides
+    /// the next message frame.
+    #[test]
+    fn model_picker_selects_override_and_send_includes_it() {
+        let mut v = ChatView::new();
+        v.apply_models_loaded(InstanceId::PRIMARY, Ok(models_payload()));
+        v.current = SessionKey::Real("s1".into());
+        v.focus = FocusTier::Input;
+
+        v.show_model_picker();
+        assert_eq!(v.focus, FocusTier::ModelPicker);
+        assert_eq!(v.model_picker_backend, "claude");
+        // Cursor starts on the default (idx 0); move down to opus, select.
+        v.keys_model_picker(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE));
+        v.keys_model_picker(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert_eq!(
+            v.selected_models.get("claude").map(String::as_str),
+            Some("claude-opus-4-8")
+        );
+        assert_eq!(v.focus, FocusTier::Insert);
+
+        v.input = TextArea::new(vec!["hi".into()]);
+        let mut actions = Vec::new();
+        v.send_input(&mut ctx(&mut actions));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Ws { msg: WsClientMsg::Message { model: Some(m), .. }, .. }
+                if m == "claude-opus-4-8"
+        )));
+    }
+
+    /// Selecting the default model clears the override (no `model` sent).
+    #[test]
+    fn model_picker_default_selection_clears_override() {
+        let mut v = ChatView::new();
+        v.apply_models_loaded(InstanceId::PRIMARY, Ok(models_payload()));
+        v.selected_models
+            .insert("claude".to_string(), "claude-opus-4-8".to_string());
+        v.current = SessionKey::Real("s1".into());
+        v.focus = FocusTier::Input;
+
+        v.show_model_picker();
+        // Cursor starts on the current override (opus, idx 1); move up to the
+        // default and select → override cleared.
+        v.keys_model_picker(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE));
+        v.keys_model_picker(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE));
+        assert!(!v.selected_models.contains_key("claude"));
+    }
+
+    /// A single-model backend has nothing to pick — the picker never opens.
+    #[test]
+    fn model_picker_single_model_is_noop() {
+        let mut v = ChatView::new();
+        v.apply_models_loaded(
+            InstanceId::PRIMARY,
+            Ok(ModelsPayload {
+                default: "claude-sonnet-4-5".to_string(),
+                defaults: std::collections::HashMap::new(),
+                backends: None,
+                models: vec![model("claude-sonnet-4-5", "anthropic", "claude")],
+            }),
+        );
+        v.current = SessionKey::Real("s1".into());
+        v.focus = FocusTier::Input;
+        v.show_model_picker();
+        assert_eq!(v.focus, FocusTier::Input);
+    }
+
+    fn setup_key(v: &mut ChatView, code: KeyCode) {
+        let mut a = Vec::new();
+        let mut c = ViewCtx {
+            app_actions: &mut a,
+            instances: &TEST_IDS,
+        };
+        v.keys_new_chat_setup(KeyEvent::new(code, KeyModifiers::NONE), &mut c);
+    }
+
+    /// Setup form: answers commit in place, ← traverses back so earlier
+    /// questions can be re-answered (re-deriving later columns), the create
+    /// carries the backend, and the first message carries that backend's model.
+    #[test]
+    fn new_chat_setup_form_reanswers_and_creates() {
+        let mut v = ChatView::new();
+        v.apply_models_loaded(InstanceId::PRIMARY, Ok(models_payload()));
+        v.current = SessionKey::NewChat;
+
+        // Single instance → the form opens with backend + model columns.
+        v.show_new_chat_setup(&TEST_IDS);
+        assert_eq!(v.focus, FocusTier::NewChatPicker);
+        assert_eq!(
+            v.setup_cols(TEST_IDS.len()),
+            vec![SetupCol::Backend, SetupCol::Model]
+        );
+        assert_eq!(v.setup_col, SetupCol::Backend);
+
+        // Backend ↓ → codex; the model column re-derives to codex models.
+        setup_key(&mut v, KeyCode::Down);
+        assert_eq!(v.new_chat_backend.as_deref(), Some("codex"));
+        assert_eq!(v.setup_model_index(), 0, "codex default selected");
+
+        // → into the model column, ↓ → non-default codex model.
+        setup_key(&mut v, KeyCode::Right);
+        assert_eq!(v.setup_col, SetupCol::Model);
+        setup_key(&mut v, KeyCode::Down);
+        assert_eq!(
+            v.selected_models.get("codex").map(String::as_str),
+            Some("gpt-5")
+        );
+
+        // ← back to the backend column and re-answer: ↑ → claude (default);
+        // the model column now shows claude models with its default selected.
+        setup_key(&mut v, KeyCode::Left);
+        assert_eq!(v.setup_col, SetupCol::Backend);
+        setup_key(&mut v, KeyCode::Up);
+        assert_eq!(v.new_chat_backend, None, "default backend = no override");
+        assert_eq!(v.current_backend(), "claude");
+        assert_eq!(v.setup_model_index(), 0, "claude default selected");
+
+        // Re-answer once more back to codex, then start the chat.
+        setup_key(&mut v, KeyCode::Down);
+        assert_eq!(v.new_chat_backend.as_deref(), Some("codex"));
+        setup_key(&mut v, KeyCode::Enter);
+        assert_eq!(v.focus, FocusTier::Insert);
+
+        // Send: the lazy create carries the backend.
+        v.input = TextArea::new(vec!["hi".into()]);
+        let mut actions = Vec::new();
+        v.send_input(&mut ctx(&mut actions));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Http { req: HttpReq::CreateSession { backend: Some(b), .. }, .. }
+                if b == "codex"
+        )));
+
+        // Materialization stamps the backend, the first message carries the
+        // codex model override, and the pending choice resets.
+        let created: Session = serde_json::from_value(serde_json::json!({ "id": "n1" })).unwrap();
+        let mut actions = Vec::new();
+        v.apply_session_created(
+            InstanceId::PRIMARY,
+            Some("hi".into()),
+            Ok(created),
+            &mut ctx(&mut actions),
+        );
+        assert_eq!(v.sessions[0].backend.as_deref(), Some("codex"));
+        assert!(actions.iter().any(|a| matches!(
+            a,
+            Action::Ws { msg: WsClientMsg::Message { model: Some(m), .. }, .. } if m == "gpt-5"
+        )));
+        assert_eq!(v.new_chat_backend, None);
+    }
+
+    /// An unavailable backend is shown but the cursor skips over it.
+    #[test]
+    fn setup_form_skips_unavailable_backend() {
+        let mut payload = models_payload();
+        if let Some(b) = payload.backends.as_mut() {
+            b.options[1].available = false;
+            b.options[1].reason = Some("codex binary not found".to_string());
+        }
+        let mut v = ChatView::new();
+        v.apply_models_loaded(InstanceId::PRIMARY, Ok(payload));
+        v.current = SessionKey::NewChat;
+
+        v.show_new_chat_setup(&TEST_IDS);
+        assert_eq!(v.setup_col, SetupCol::Backend);
+        setup_key(&mut v, KeyCode::Down);
+        assert_eq!(v.new_chat_backend, None, "unavailable codex skipped");
+        setup_key(&mut v, KeyCode::Enter);
+        assert_eq!(v.focus, FocusTier::Insert, "claude still selectable");
     }
 
     /// Sending routes the Message over the current session's instance, not

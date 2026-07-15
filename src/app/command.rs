@@ -9,7 +9,7 @@ use crate::view::chat::ChatCommand;
 /// resolution also accepts the singular (toggling a trailing `s`).
 pub const COMMANDS: &[&str] = &[
     "chat", "notifs", "tasks", "plans", "skills", "new", "fork", "resume", "rename", "delete",
-    "reload", "help", "quit", "cron", "sources", "memory", "diag",
+    "model", "reload", "help", "quit", "cron", "sources", "memory", "diag",
 ];
 
 /// Commands whose canonical name starts with `prefix` (case-insensitive). An
@@ -69,12 +69,11 @@ pub fn run_command(app: &mut App, line: &str) -> Vec<Action> {
         }
         "new" => {
             let actions = chat_command(app, ChatCommand::NewChat(opt_string(rest)));
-            // With several instances connected, ask which one before typing.
-            if app.instances.len() > 1 {
-                let ids = app.instance_ids.clone();
-                if let Some(chat) = crate::app::update::chat_view_mut(app) {
-                    chat.show_new_chat_picker(&ids);
-                }
+            // Setup form before typing — instance / backend / model columns,
+            // shown only when something offers a real choice.
+            let ids = app.instance_ids.clone();
+            if let Some(chat) = crate::app::update::chat_view_mut(app) {
+                chat.show_new_chat_setup(&ids);
             }
             actions
         }
@@ -82,6 +81,13 @@ pub fn run_command(app: &mut App, line: &str) -> Vec<Action> {
         "resume" => chat_command(app, ChatCommand::Resume),
         "rename" => chat_command(app, ChatCommand::Rename(opt_string(rest))),
         "delete" => chat_command(app, ChatCommand::Delete),
+        "model" | "models" => {
+            if let Some(chat) = crate::app::update::chat_view_mut(app) {
+                chat.show_model_picker();
+            }
+            app.mark_dirty();
+            Vec::new()
+        }
         // Otherwise: jump to a tab by its id (chat, notifs, tasks, plans,
         // skills, cron, sources, memory, diag).
         other => switch_to_view(app, other),

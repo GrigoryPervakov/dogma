@@ -45,7 +45,11 @@ pub fn update(app: &mut App, event: AppEvent) -> Vec<Action> {
         AppEvent::Term(TermEvent::Resize(_, _)) => {
             app.mark_dirty();
         }
-        AppEvent::Term(_) => { /* ignore mouse / paste / focus for v1 */ }
+        AppEvent::Term(TermEvent::Paste(text)) => {
+            handle_paste(app, text);
+            app.mark_dirty();
+        }
+        AppEvent::Term(_) => { /* ignore mouse / focus for v1 */ }
         AppEvent::Inst { instance, ev } => {
             match *ev {
                 ConnEvent::Wire(msg) => actions.extend(handle_wire(app, instance, msg)),
@@ -147,6 +151,21 @@ fn handle_key(app: &mut App, key: KeyEvent, actions: &mut Vec<Action>) {
     app.views[idx].handle_key(key, &mut ctx);
 }
 
+/// A bracketed paste lands in the chat composer when it's the active view and
+/// the input is focused. Multi-line content stays one message (the terminal
+/// batches it into a single event, so embedded newlines don't submit).
+fn handle_paste(app: &mut App, text: String) {
+    if !matches!(app.mode, Mode::Normal) {
+        return;
+    }
+    if app.views[app.current_view].id() != "chat" {
+        return;
+    }
+    if let Some(chat) = chat_view_mut(app) {
+        chat.paste_into_input(&text);
+    }
+}
+
 fn handle_command_key(app: &mut App, key: KeyEvent, actions: &mut Vec<Action>) {
     match key.code {
         KeyCode::Esc => {
@@ -230,6 +249,10 @@ fn handle_conn(app: &mut App, instance: InstanceId, c: WsConnEvent) -> Vec<Actio
             Action::Http {
                 instance,
                 req: HttpReq::ListNotifications,
+            },
+            Action::Http {
+                instance,
+                req: HttpReq::ListModels,
             },
         ]
     } else {
@@ -335,6 +358,11 @@ fn handle_http(
         } => {
             if let Some(view) = chat_view_mut(app) {
                 view.apply_file_diff(instance, &session_id, &path, result);
+            }
+        }
+        HttpResultKind::Models(result) => {
+            if let Some(view) = chat_view_mut(app) {
+                view.apply_models_loaded(instance, result);
             }
         }
     }

@@ -9,6 +9,7 @@ use std::process::ExitCode;
 
 use anyhow::{Context, Result};
 use clap::Parser;
+use crossterm::event::{DisableBracketedPaste, EnableBracketedPaste};
 use crossterm::execute;
 use crossterm::terminal::{
     EnterAlternateScreen, LeaveAlternateScreen, SetTitle, disable_raw_mode, enable_raw_mode,
@@ -178,7 +179,12 @@ async fn run(args: Args, cfg: Config) -> std::result::Result<(), u8> {
         return Err(2);
     }
     let mut stdout = io::stdout();
-    if let Err(e) = execute!(stdout, EnterAlternateScreen, SetTitle(title(&instances))) {
+    if let Err(e) = execute!(
+        stdout,
+        EnterAlternateScreen,
+        EnableBracketedPaste,
+        SetTitle(title(&instances))
+    ) {
         eprintln!("error: enter alt screen: {e:#}");
         let _ = disable_raw_mode();
         return Err(2);
@@ -198,7 +204,7 @@ async fn run(args: Args, cfg: Config) -> std::result::Result<(), u8> {
     let default_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        let _ = execute!(io::stdout(), DisableBracketedPaste, LeaveAlternateScreen);
         default_hook(info);
     }));
 
@@ -208,7 +214,11 @@ async fn run(args: Args, cfg: Config) -> std::result::Result<(), u8> {
 
     // 5. Restore terminal.
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = execute!(
+        terminal.backend_mut(),
+        DisableBracketedPaste,
+        LeaveAlternateScreen
+    );
     let _ = terminal.show_cursor();
 
     if let Some(fatal) = app.fatal {
@@ -368,9 +378,13 @@ async fn run_http(http: &HttpClient, req: HttpReq) -> HttpResultKind {
                 result,
             }
         }
-        HttpReq::CreateSession { title, content } => {
+        HttpReq::CreateSession {
+            title,
+            content,
+            backend,
+        } => {
             let result = http
-                .create_session(title.as_deref())
+                .create_session(title.as_deref(), backend.as_deref())
                 .await
                 .map_err(|e| format!("{e:#}"));
             HttpResultKind::SessionCreated {
@@ -452,6 +466,9 @@ async fn run_http(http: &HttpClient, req: HttpReq) -> HttpResultKind {
                 path,
                 result,
             }
+        }
+        HttpReq::ListModels => {
+            HttpResultKind::Models(http.list_models().await.map_err(|e| format!("{e:#}")))
         }
     }
 }

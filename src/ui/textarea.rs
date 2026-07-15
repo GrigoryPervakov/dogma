@@ -117,6 +117,25 @@ impl TextArea {
         }
     }
 
+    /// Insert a (possibly multi-line) string at the cursor, e.g. a bracketed
+    /// paste. `\r\n` and lone `\r` are normalized to `\n` so a paste splits
+    /// into lines instead of submitting at the first newline.
+    pub fn insert_str(&mut self, s: &str) {
+        let normalized = s.replace("\r\n", "\n").replace('\r', "\n");
+        let mut segments = normalized.split('\n');
+        if let Some(first) = segments.next() {
+            for c in first.chars() {
+                self.insert_char(c);
+            }
+        }
+        for seg in segments {
+            self.insert_newline();
+            for c in seg.chars() {
+                self.insert_char(c);
+            }
+        }
+    }
+
     // ----- editing primitives ---------------------------------------------
 
     fn insert_char(&mut self, c: char) {
@@ -385,6 +404,26 @@ mod tests {
         }
         ta.input(k(KeyCode::Enter));
         assert_eq!(ta.lines(), &["hello".to_string(), " world".to_string()]);
+    }
+
+    #[test]
+    fn insert_str_multiline_paste_splits_and_keeps_tail() {
+        let mut ta = TextArea::new(vec!["abcd".into()]);
+        // Cursor at end; move left twice → between "ab" and "cd".
+        ta.input(k(KeyCode::Left));
+        ta.input(k(KeyCode::Left));
+        ta.insert_str("X\nY");
+        assert_eq!(ta.lines(), &["abX".to_string(), "Ycd".to_string()]);
+    }
+
+    #[test]
+    fn insert_str_normalizes_crlf() {
+        let mut ta = TextArea::default();
+        ta.insert_str("one\r\ntwo\rthree");
+        assert_eq!(
+            ta.lines(),
+            &["one".to_string(), "two".to_string(), "three".to_string()]
+        );
     }
 
     #[test]

@@ -29,6 +29,13 @@ pub struct Session {
     pub message_count: u32,
     #[serde(default)]
     pub total_cost_usd: f64,
+    /// Resolved model bound to the session's SDK client (set at connect time).
+    #[serde(default)]
+    pub model: Option<String>,
+    /// Agent backend serving this session (`claude` / `codex`). Sticky —
+    /// chosen at creation, never changes.
+    #[serde(default)]
+    pub backend: Option<String>,
     /// Which Nerve instance this session came from. Stamped at ingest, never
     /// on the wire.
     #[serde(default, skip)]

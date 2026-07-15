@@ -38,9 +38,11 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
             let sref = SessionRef::new(instance, session_id);
             if *is_running {
                 // The server resends the whole in-flight turn — rebuild the
-                // streaming buffer from scratch so a reconnect-replay can't
-                // double-append onto a buffer we already had.
+                // streaming buffer (and this session's sub-agent panels) from
+                // scratch so a reconnect-replay can't double-append onto
+                // state we already had.
                 view.streaming.remove(&sref);
+                view.side_panel.panels.retain(|p| p.session != sref);
                 for ev in buffered_events {
                     apply(view, instance, ev, ctx);
                 }
@@ -57,10 +59,10 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
             content,
             parent_tool_use_id,
         } => {
+            let sref = SessionRef::new(instance, session_id);
             if let Some(parent) = parent_tool_use_id.as_ref() {
-                push_text_to_panel(view, parent, content);
+                push_text_to_panel(view, &sref, parent, content);
             } else {
-                let sref = SessionRef::new(instance, session_id);
                 let m = stream_msg_mut(view, &sref);
                 append_text(m, content);
                 view.agent_status.insert(sref, AgentStatus::Writing);
@@ -72,10 +74,10 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
             content,
             parent_tool_use_id,
         } => {
+            let sref = SessionRef::new(instance, session_id);
             if let Some(parent) = parent_tool_use_id.as_ref() {
-                push_thinking_to_panel(view, parent, content);
+                push_thinking_to_panel(view, &sref, parent, content);
             } else {
-                let sref = SessionRef::new(instance, session_id);
                 let m = stream_msg_mut(view, &sref);
                 append_thinking(m, content);
                 view.agent_status.insert(sref, AgentStatus::Thinking);
@@ -91,11 +93,11 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
         } => {
             let id = tool_use_id.clone().unwrap_or_default();
             let parent = parent_tool_use_id.clone();
+            let sref = SessionRef::new(instance, session_id);
 
             if let Some(parent_id) = parent {
-                add_tool_call_to_panel(view, &parent_id, &id, tool, input);
+                add_tool_call_to_panel(view, &sref, &parent_id, &id, tool, input);
             } else {
-                let sref = SessionRef::new(instance, session_id);
                 let m = stream_msg_mut(view, &sref);
                 upsert_tool_call(m, &id, tool, input, None, false, ToolCallStatus::Streaming);
                 view.agent_status
@@ -112,10 +114,10 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
         } => {
             let id = tool_use_id.clone().unwrap_or_default();
             let err = is_error.unwrap_or(false);
+            let sref = SessionRef::new(instance, session_id);
             if let Some(parent_id) = parent_tool_use_id.as_ref() {
-                set_tool_result_in_panel(view, parent_id, &id, result, err);
+                set_tool_result_in_panel(view, &sref, parent_id, &id, result, err);
             } else {
-                let sref = SessionRef::new(instance, session_id);
                 let m = stream_msg_mut(view, &sref);
                 set_tool_result(m, &id, result, err);
             }
@@ -136,6 +138,10 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
                     .push(streaming);
             }
             view.agent_status.insert(sref.clone(), AgentStatus::Idle);
+            // The turn is over — its sub-agent panels are static now (the
+            // transcript lives in history), so drop them instead of letting
+            // them pile up across turns.
+            view.side_panel.panels.retain(|p| p.session != sref);
             // Update context usage.
             let entry = view.context.entry(sref.clone()).or_default();
             if let Some(u) = usage.clone() {
@@ -171,6 +177,7 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
                     .or_default()
                     .push(streaming);
             }
+            view.side_panel.panels.retain(|p| p.session != sref);
             view.agent_status.insert(sref, AgentStatus::Idle);
         }
 
@@ -246,6 +253,7 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
         }
 
         WsServerMsg::SubagentStart {
+            session_id,
             tool_use_id,
             subagent_type,
             description,
@@ -264,6 +272,7 @@ pub fn apply(view: &mut ChatView, instance: InstanceId, msg: &WsServerMsg, ctx: 
                     description: description.clone(),
                     blocks: Vec::new(),
                     running: true,
+                    session: SessionRef::new(instance, session_id),
                 });
                 view.side_panel.visible = true;
             }
@@ -327,7 +336,10 @@ fn update_follow_tail_selection(view: &mut ChatView) {
     // just ChatBlocks. Skip the tiers that replace the message area.
     if matches!(
         view.focus,
-        FocusTier::BlockInterior | FocusTier::Files | FocusTier::NewChatPicker
+        FocusTier::BlockInterior
+            | FocusTier::Files
+            | FocusTier::NewChatPicker
+            | FocusTier::ModelPicker
     ) {
         return;
     }
@@ -355,6 +367,7 @@ pub(super) fn heal_session(view: &mut ChatView, sref: &SessionRef) {
             .or_default()
             .push(streaming);
     }
+    view.side_panel.panels.retain(|p| p.session != *sref);
     view.agent_status.insert(sref.clone(), AgentStatus::Idle);
     if let Some(s) = view
         .sessions
@@ -438,7 +451,11 @@ fn set_tool_result(msg: &mut Message, id: &str, result: &str, is_error: bool) {
 
 // ---------- side-panel routing for sub-agent events ------------------------
 
-fn ensure_panel<'a>(view: &'a mut ChatView, parent_id: &str) -> &'a mut SubAgentPanel {
+fn ensure_panel<'a>(
+    view: &'a mut ChatView,
+    sref: &SessionRef,
+    parent_id: &str,
+) -> &'a mut SubAgentPanel {
     if !view
         .side_panel
         .panels
@@ -451,6 +468,7 @@ fn ensure_panel<'a>(view: &'a mut ChatView, parent_id: &str) -> &'a mut SubAgent
             description: String::new(),
             blocks: Vec::new(),
             running: true,
+            session: sref.clone(),
         });
         view.side_panel.visible = true;
     }
@@ -461,8 +479,8 @@ fn ensure_panel<'a>(view: &'a mut ChatView, parent_id: &str) -> &'a mut SubAgent
         .expect("panel just inserted")
 }
 
-fn push_text_to_panel(view: &mut ChatView, parent_id: &str, content: &str) {
-    let p = ensure_panel(view, parent_id);
+fn push_text_to_panel(view: &mut ChatView, sref: &SessionRef, parent_id: &str, content: &str) {
+    let p = ensure_panel(view, sref, parent_id);
     if let Some(Block::Text { content: c }) = p.blocks.last_mut() {
         c.push_str(content);
         return;
@@ -472,8 +490,8 @@ fn push_text_to_panel(view: &mut ChatView, parent_id: &str, content: &str) {
     });
 }
 
-fn push_thinking_to_panel(view: &mut ChatView, parent_id: &str, content: &str) {
-    let p = ensure_panel(view, parent_id);
+fn push_thinking_to_panel(view: &mut ChatView, sref: &SessionRef, parent_id: &str, content: &str) {
+    let p = ensure_panel(view, sref, parent_id);
     if let Some(Block::Thinking { content: c }) = p.blocks.last_mut() {
         c.push_str(content);
         return;
@@ -485,12 +503,13 @@ fn push_thinking_to_panel(view: &mut ChatView, parent_id: &str, content: &str) {
 
 fn add_tool_call_to_panel(
     view: &mut ChatView,
+    sref: &SessionRef,
     parent_id: &str,
     tool_use_id: &str,
     tool: &str,
     input: &Value,
 ) {
-    let p = ensure_panel(view, parent_id);
+    let p = ensure_panel(view, sref, parent_id);
     if let Some(Block::ToolCall(tc)) = p
         .blocks
         .iter_mut()
@@ -513,12 +532,13 @@ fn add_tool_call_to_panel(
 
 fn set_tool_result_in_panel(
     view: &mut ChatView,
+    sref: &SessionRef,
     parent_id: &str,
     tool_use_id: &str,
     result: &str,
     is_error: bool,
 ) {
-    let p = ensure_panel(view, parent_id);
+    let p = ensure_panel(view, sref, parent_id);
     if let Some(Block::ToolCall(tc)) = p
         .blocks
         .iter_mut()
@@ -678,6 +698,54 @@ mod tests {
         );
         assert!(!v.streaming.contains_key(&sref("s1")));
         assert_eq!(v.history.get(&sref("s1")).map(|h| h.len()), Some(1));
+    }
+
+    fn subagent_start(session_id: &str, tool_use_id: &str) -> WsServerMsg {
+        WsServerMsg::SubagentStart {
+            session_id: session_id.into(),
+            tool_use_id: tool_use_id.into(),
+            subagent_type: "wait".into(),
+            description: "Codex subagent".into(),
+            model: None,
+        }
+    }
+
+    /// Panels are scoped to their session — a background session's sub-agents
+    /// don't show on the current chat — and a finished turn prunes its own.
+    #[test]
+    fn subagent_panels_scoped_per_session_and_pruned_on_done() {
+        let mut v = empty_view();
+        v.current = SessionKey::Real("s1".into());
+        let mut a = Vec::new();
+        let mut ctx = fake_ctx(&mut a);
+
+        play(&mut v, &subagent_start("bg", "t-bg"), &mut ctx);
+        play(&mut v, &subagent_start("s1", "t-s1"), &mut ctx);
+        assert_eq!(v.side_panel.panels.len(), 2);
+        let current: Vec<&str> = v
+            .current_panels()
+            .iter()
+            .map(|p| p.tool_use_id.as_str())
+            .collect();
+        assert_eq!(current, vec!["t-s1"]);
+
+        // Replayed start is idempotent — no duplicate row.
+        play(&mut v, &subagent_start("bg", "t-bg"), &mut ctx);
+        assert_eq!(v.side_panel.panels.len(), 2);
+
+        // The background session finishing prunes only its own panels.
+        play(
+            &mut v,
+            &WsServerMsg::Done {
+                session_id: "bg".into(),
+                usage: None,
+                max_context_tokens: None,
+                num_turns: None,
+            },
+            &mut ctx,
+        );
+        assert_eq!(v.side_panel.panels.len(), 1);
+        assert_eq!(v.side_panel.panels[0].tool_use_id, "t-s1");
     }
 
     // -----------------------------------------------------------------------

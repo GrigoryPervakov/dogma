@@ -67,6 +67,8 @@ fn user_session(id: &str, title: &str) -> Session {
         source: Some("web".into()),
         message_count: 5,
         total_cost_usd: 0.0,
+        model: None,
+        backend: None,
         instance: Default::default(),
     }
 }
@@ -83,6 +85,8 @@ fn cron_session(id: &str, title: &str) -> Session {
         source: Some("cron".into()),
         message_count: 2,
         total_cost_usd: 0.0,
+        model: None,
+        backend: None,
         instance: Default::default(),
     }
 }
@@ -193,7 +197,7 @@ fn new_chat_picker_lists_instances() {
     app.instances[1].ws = WsConnState::Connected;
     with_chat(&mut app, |chat| {
         chat.sessions_loaded = true;
-        chat.show_new_chat_picker(&[InstanceId(0), InstanceId(1)]);
+        chat.show_new_chat_setup(&[InstanceId(0), InstanceId(1)]);
     });
     insta::assert_snapshot!(render_buf(&mut app, 100, 16));
 }

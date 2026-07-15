@@ -276,13 +276,20 @@ impl HttpClient {
         })
     }
 
-    pub async fn create_session(&self, title: Option<&str>) -> Result<Session> {
+    pub async fn create_session(
+        &self,
+        title: Option<&str>,
+        backend: Option<&str>,
+    ) -> Result<Session> {
         // "external" is the upstream bucket for satellite API clients (dogma,
         // Codex, etc.); upstream has no "tui" source, so reuse "external".
-        let body = match title {
-            Some(t) => json!({ "title": t, "source": "external" }),
-            None => json!({ "source": "external" }),
-        };
+        let mut body = json!({ "source": "external" });
+        if let Some(t) = title {
+            body["title"] = json!(t);
+        }
+        if let Some(b) = backend {
+            body["backend"] = json!(b);
+        }
         let url = self.url("/api/sessions");
         let resp = self
             .send(move |c| c.post(url.as_str()).json(&body))
@@ -352,6 +359,10 @@ impl HttpClient {
     pub async fn get_skill(&self, skill_id: &str) -> Result<Skill> {
         self.get_json(&format!("/api/skills/{skill_id}"), "get skill")
             .await
+    }
+
+    pub async fn list_models(&self) -> Result<crate::api::types::ModelsPayload> {
+        self.get_json("/api/models", "list models").await
     }
 
     // -------------------------------------------------------------------

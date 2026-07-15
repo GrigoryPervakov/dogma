@@ -223,6 +223,10 @@ pub enum WsClientMsg {
         content: String,
         #[serde(skip_serializing_if = "Option::is_none")]
         file_ids: Option<Vec<String>>,
+        /// Composer model override (from the model picker). Omitted when unset
+        /// so single-model setups send an identical frame to before.
+        #[serde(skip_serializing_if = "Option::is_none")]
+        model: Option<String>,
     },
     Stop {
         session_id: String,
@@ -283,6 +287,9 @@ pub enum HttpReq {
         title: Option<String>,
         /// First message to send once the session exists (lazy new-chat flow).
         content: Option<String>,
+        /// Agent backend for the new session (`None` = server default).
+        /// Sticky after creation — this is the only place it can be chosen.
+        backend: Option<String>,
     },
 
     ListTasks,
@@ -322,6 +329,59 @@ pub enum HttpReq {
         session_id: String,
         path: String,
     },
+    ListModels,
+}
+
+/// One selectable chat model from `GET /api/models`. `provider` is
+/// `"anthropic"`, `"openai"`, or `"ollama"`; `backend` is the agent backend
+/// that serves it (`"claude"` / `"codex"`; empty on pre-backend servers).
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelOption {
+    pub id: String,
+    #[serde(default)]
+    pub provider: String,
+    #[serde(default)]
+    pub backend: String,
+}
+
+/// One agent backend from `GET /api/models` `backends.options`. Unavailable
+/// backends are advertised with `available: false` + a `reason` so the picker
+/// can show (but not select) them.
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackendOption {
+    pub id: String,
+    #[serde(default)]
+    pub label: String,
+    #[serde(default = "de_true")]
+    pub available: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+pub struct BackendsInfo {
+    #[serde(default)]
+    pub default: String,
+    #[serde(default)]
+    pub options: Vec<BackendOption>,
+}
+
+fn de_true() -> bool {
+    true
+}
+
+/// Decoded `GET /api/models` body. Extra fields (e.g. `ollama`) are ignored;
+/// `defaults`/`backends` are absent on pre-backend servers.
+#[derive(Debug, Clone, Deserialize)]
+pub struct ModelsPayload {
+    #[serde(default)]
+    pub default: String,
+    #[serde(default)]
+    pub defaults: std::collections::HashMap<String, String>,
+    #[serde(default)]
+    pub backends: Option<BackendsInfo>,
+    #[serde(default)]
+    pub models: Vec<ModelOption>,
 }
 
 /// Body returned from `GET /api/sessions/{id}/messages` after decoding.
@@ -387,4 +447,5 @@ pub enum HttpResultKind {
         path: String,
         result: Result<crate::model::FileDiff, String>,
     },
+    Models(Result<ModelsPayload, String>),
 }

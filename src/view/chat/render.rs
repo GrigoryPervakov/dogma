@@ -8,15 +8,16 @@ use ratatui::widgets::{Block as RatBlock, Borders, Paragraph, Wrap};
 
 use super::blocks::{BlockSelection, render_item};
 use super::items;
-use super::state::{ChatView, FocusTier, SessionKey};
+use super::state::{ChatView, FocusTier, SessionKey, SetupCol};
 use crate::app::state::InstanceMeta;
 use crate::ui::theme;
+use crate::ui::truncate;
 use crate::view::ViewRenderCtx;
 
 pub fn render(view: &mut ChatView, area: Rect, frame: &mut Frame, ctx: &ViewRenderCtx<'_>) {
     let show_sidebar = view.sidebar_visible && area.width >= 80;
     let show_panel =
-        view.side_panel.visible && !view.side_panel.panels.is_empty() && area.width >= 100;
+        view.side_panel.visible && !view.current_panels().is_empty() && area.width >= 100;
 
     // Responsive sidebar: ~28% of the width, clamped so titles (plus the
     // instance badge) fit on wide terminals without starving the chat on
@@ -65,9 +66,12 @@ fn render_main(view: &mut ChatView, frame: &mut Frame, area: Rect, instances: &[
     // While the active session streams, the input box is removed and the
     // whole chat gets a green frame instead.
     let streaming = view.is_current_streaming();
-    // The new-chat instance picker takes over the input slot.
-    let picker_lines = matches!(view.focus, FocusTier::NewChatPicker)
-        .then(|| new_chat_picker_lines(view, instances));
+    // A picker (new-chat setup form / composer model) takes over the input slot.
+    let picker: Option<(Vec<Line<'static>>, &'static str)> = match view.focus {
+        FocusTier::NewChatPicker => Some((new_chat_setup_lines(view, instances), " new chat ")),
+        FocusTier::ModelPicker => Some((model_picker_lines(view), " model ")),
+        _ => None,
+    };
     let input_height = compute_input_height(view, area.width);
 
     let task_height = task_lines
@@ -76,9 +80,9 @@ fn render_main(view: &mut ChatView, frame: &mut Frame, area: Rect, instances: &[
     let poll_height = poll_lines
         .as_ref()
         .map(|l| ((l.len() as u16) + 2).clamp(3, (area.height / 2).max(3)));
-    let picker_height = picker_lines
+    let picker_height = picker
         .as_ref()
-        .map(|l| ((l.len() as u16) + 2).clamp(3, (area.height / 2).max(3)));
+        .map(|(l, _)| ((l.len() as u16) + 2).clamp(3, (area.height / 2).max(3)));
 
     let mut constraints = vec![Constraint::Length(1), Constraint::Min(0)];
     if let Some(h) = task_height {
@@ -105,39 +109,219 @@ fn render_main(view: &mut ChatView, frame: &mut Frame, area: Rect, instances: &[
         render_poll_card(frame, layout[idx], lines);
         idx += 1;
     }
-    if let (Some(lines), Some(_)) = (picker_lines, picker_height) {
-        render_side_block(frame, layout[idx], lines, " new chat ");
+    if let (Some((lines, title)), Some(_)) = (picker, picker_height) {
+        render_side_block(frame, layout[idx], lines, title);
     } else if !streaming {
         render_input(view, frame, layout[idx]);
     }
 }
 
-/// Lines for the new-chat instance picker card.
-fn new_chat_picker_lines(view: &ChatView, instances: &[InstanceMeta]) -> Vec<Line<'static>> {
+/// One rendered column of the setup form.
+struct SetupColumn {
+    title: &'static str,
+    rows: Vec<(String, Style)>,
+    selected: usize,
+}
+
+/// The new-chat setup form: one column per open question (instance / backend
+/// / model). ←→ moves between columns so earlier answers can be revisited;
+/// ↑↓ re-picks in place (the highlighted row *is* the answer).
+fn new_chat_setup_lines(view: &ChatView, instances: &[InstanceMeta]) -> Vec<Line<'static>> {
+    let ids: Vec<crate::instance::InstanceId> = instances.iter().map(|m| m.id).collect();
+    let cols = view.setup_cols(ids.len());
+    let inst = view.current_instance();
+    let backend = view.current_backend();
+
+    let mut built: Vec<SetupColumn> = Vec::new();
+    for col in &cols {
+        match col {
+            SetupCol::Instance => {
+                let rows = instances
+                    .iter()
+                    .map(|m| {
+                        (
+                            format!("{} {}", theme::instance_sigil(m.id), m.label),
+                            Style::default().fg(theme::instance_color(m.id)),
+                        )
+                    })
+                    .collect();
+                built.push(SetupColumn {
+                    title: "instance",
+                    rows,
+                    selected: view.setup_instance_index(&ids),
+                });
+            }
+            SetupCol::Backend => {
+                let rows = view
+                    .backends
+                    .get(&inst)
+                    .map(|info| {
+                        info.options
+                            .iter()
+                            .map(|o| {
+                                let label = if o.label.is_empty() { &o.id } else { &o.label };
+                                if o.available {
+                                    let tag = if o.id == info.default {
+                                        " (default)"
+                                    } else {
+                                        ""
+                                    };
+                                    (format!("{label}{tag}"), Style::default())
+                                } else {
+                                    let reason = o.reason.as_deref().unwrap_or("unavailable");
+                                    (
+                                        format!("{label} · {reason}"),
+                                        Style::default().add_modifier(Modifier::DIM),
+                                    )
+                                }
+                            })
+                            .collect()
+                    })
+                    .unwrap_or_default();
+                built.push(SetupColumn {
+                    title: "backend",
+                    rows,
+                    selected: view.setup_backend_index(),
+                });
+            }
+            SetupCol::Model => {
+                let default = view.model_defaults.get(&inst).and_then(|d| d.get(&backend));
+                let rows = view
+                    .backend_models(&backend)
+                    .iter()
+                    .map(|m| {
+                        let tag = if default == Some(&m.id) {
+                            " (default)"
+                        } else {
+                            ""
+                        };
+                        (format!("{}{tag}", m.id), Style::default())
+                    })
+                    .collect();
+                built.push(SetupColumn {
+                    title: "model",
+                    rows,
+                    selected: view.setup_model_index(),
+                });
+            }
+        }
+    }
+
+    // Column width: widest cell (or title), clamped; +2 cursor prefix,
+    // +2 gutter.
+    const MAX_CELL: usize = 40;
+    let widths: Vec<usize> = built
+        .iter()
+        .map(|c| {
+            c.rows
+                .iter()
+                .map(|(s, _)| s.chars().count())
+                .chain([c.title.chars().count()])
+                .max()
+                .unwrap_or(0)
+                .min(MAX_CELL)
+                + 4
+        })
+        .collect();
+
+    let mut out = Vec::new();
+    let mut header: Vec<Span<'static>> = Vec::new();
+    for (i, c) in built.iter().enumerate() {
+        let style = if cols[i] == view.setup_col {
+            Style::default()
+                .fg(Color::Cyan)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().add_modifier(Modifier::DIM)
+        };
+        header.push(Span::styled(
+            pad(&format!("  {}", c.title), widths[i]),
+            style,
+        ));
+    }
+    out.push(Line::from(header));
+    out.push(Line::raw(""));
+
+    let n_rows = built.iter().map(|c| c.rows.len()).max().unwrap_or(0);
+    for r in 0..n_rows {
+        let mut spans: Vec<Span<'static>> = Vec::new();
+        for (i, c) in built.iter().enumerate() {
+            let Some((text, base)) = c.rows.get(r) else {
+                spans.push(Span::raw(" ".repeat(widths[i])));
+                continue;
+            };
+            let focused = cols[i] == view.setup_col;
+            let selected = r == c.selected;
+            let prefix = match (selected, focused) {
+                (true, true) => "▸ ",
+                (true, false) => "● ",
+                _ => "  ",
+            };
+            let cell = pad(&format!("{prefix}{}", truncate(text, MAX_CELL)), widths[i]);
+            let style = if selected && focused {
+                Style::default().fg(Color::Black).bg(Color::Cyan)
+            } else if selected {
+                base.add_modifier(Modifier::BOLD)
+            } else {
+                *base
+            };
+            spans.push(Span::styled(cell, style));
+        }
+        out.push(Line::from(spans));
+    }
+    // No in-card key hint — the statusbar right-hint covers this tier.
+    out
+}
+
+fn pad(s: &str, w: usize) -> String {
+    let len = s.chars().count();
+    if len >= w {
+        s.to_string()
+    } else {
+        format!("{s}{}", " ".repeat(w - len))
+    }
+}
+
+/// Lines for the composer model picker card (models of one backend).
+fn model_picker_lines(view: &ChatView) -> Vec<Line<'static>> {
+    let backend = view.model_picker_backend.clone();
+    let default = view
+        .model_defaults
+        .get(&view.current_instance())
+        .and_then(|d| d.get(&backend));
+    let active = view.selected_models.get(&backend).or(default);
     let mut out = vec![
         Line::from(Span::styled(
-            "Start new chat on:",
+            format!("Model for your next message ({backend}):"),
             Style::default().add_modifier(Modifier::BOLD),
         )),
         Line::raw(""),
     ];
-    for (i, m) in instances.iter().enumerate() {
-        let on = i == view.new_chat_pick;
-        let color = theme::instance_color(m.id);
+    for (i, m) in view.backend_models(&backend).into_iter().enumerate() {
+        let on = i == view.model_pick;
+        let is_active = active == Some(&m.id);
         let prefix = if on { "▸ " } else { "  " };
-        let style = if on {
-            Style::default().fg(Color::Black).bg(color)
+        let default_tag = if default == Some(&m.id) {
+            " (default)"
         } else {
-            Style::default().fg(color)
+            ""
         };
-        out.push(Line::from(Span::styled(
-            format!("{prefix}{} {}", theme::instance_sigil(m.id), m.label),
-            style,
-        )));
+        let name_style = if on {
+            Style::default().fg(Color::Black).bg(Color::Cyan)
+        } else {
+            Style::default()
+        };
+        out.push(Line::from(vec![
+            Span::styled(format!("{prefix}{}{}", m.id, default_tag), name_style),
+            Span::styled(
+                format!(" · {}{}", m.provider, if is_active { " ●" } else { "" }),
+                Style::default().add_modifier(Modifier::DIM),
+            ),
+        ]));
     }
     out.push(Line::raw(""));
     out.push(Line::from(Span::styled(
-        "↑↓ pick · Enter ok · Esc cancel",
+        "↑↓ pick · Enter select · Esc cancel",
         Style::default().add_modifier(Modifier::DIM),
     )));
     out
@@ -512,7 +696,7 @@ fn render_panel(view: &ChatView, frame: &mut Frame, area: Rect) {
     frame.render_widget(blk, area);
 
     let mut lines: Vec<Line<'_>> = Vec::new();
-    for p in &view.side_panel.panels {
+    for p in view.current_panels() {
         let head = format!(
             "{} · {} {}",
             if p.running { "⠋" } else { "✓" },
